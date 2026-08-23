@@ -124,6 +124,52 @@ your P&L is theirs to take.
 
 ---
 
+## The rules of the market
+
+The arena enforces the same microstructure rules real US equity venues do.
+Your bot will meet these — each rejection names its rule (watch **MY TEAM →
+DESK EVENTS** when orders seem to vanish):
+
+| Rule | What it means for you | Reject code |
+|---|---|---|
+| **Penny ticks** | Prices snap to $0.01, toward the passive side (buys round down, sells up). Queue priority is real — you can't sub-penny the queue. | — (snapped silently; the ack shows the real price) |
+| **Self-trade prevention** | Your order never fills against your own resting order — the resting one is cancelled instead (you'll see `STP_CANCEL`). Wash trades are impossible. | `STP_CANCEL` |
+| **LULD price band** | Limit prices further than ~10% from the venue mark are rejected — the fat-finger collar. | `PRICE_BAND` |
+| **Short-sale rule** | A symbol down 10% from the open goes under SSR: new shorts must be limit orders resting above the bid. | `SSR_RESTRICTED` |
+| **Borrow locate** | Total short interest per symbol is capped market-wide. No borrow, no short. | `BORROW_UNAVAILABLE` |
+| **Halts** | Per-symbol velocity/session halts and market-wide circuit breakers (−7/−13/−20%). | `SYMBOL_HALTED` |
+| **Order quota** | Cancel/replace spam is metered per tick. | `RATE_LIMITED` |
+
+**Order types**: `limit`, `market`, `ioc`, `post_only` (maker-rebate
+guaranteed), plus **`stop`** and **`stop_limit`** — held at the venue, armed
+at `stop_price`, fired by prints or the mark.
+
+**Auctions**: when enabled, START first runs a pre-open — only limit orders,
+resting unmatched, with indicative price/imbalance broadcast every tick —
+then one volume-maximizing cross opens the market (`SESSION_PREOPEN` /
+`AUCTION_INDICATIVE` / `AUCTION_RESULT` events). A closing auction can
+mirror it at the close. Orders sent during an auction window that aren't
+limit/post-only get `AUCTION_ONLY_LIMIT`.
+
+**A note on fee scale**: the arena's fees (~15 bps taker / 10 bps maker
+rebate) are deliberately ~50× real-world equity fees (real venues charge
+about $0.0030/share ≈ 0.3 bps). Exaggerated fees make execution costs
+*teachable* — you feel them in a 30-minute session. The mechanics are
+faithful; recalibrate the magnitudes before quoting them in a real job.
+
+---
+
+## The consolidated tape and the order ticket
+
+- **`GET <arena>/api/nbbo`** — the SIP: national best bid/offer across every
+  venue with venue attribution, plus the last print. If `bid > ask` across
+  two venues, that's a real arbitrage (Level 6, OPTION F).
+- **MY TEAM → ORDER TICKET** — trade by hand as one of your bots, through
+  the exact same order path your code uses. Feel the spread, pay the fee,
+  see the fill on FLOW, then go automate it.
+
+---
+
 ## Choosing a venue — fee schedules
 
 When the game runs **multiple exchanges** (student teams can license their

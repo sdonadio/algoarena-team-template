@@ -52,8 +52,11 @@ Already working in your starters. Your job is to run it and understand it.
 | Role | Task | Where |
 |---|---|---|
 | 🤖 | **Trade the calendar** (OPTION G): events are announced with timing but not direction — store them via `on_event`, cut risk into the print or straddle it | `team/trader.py → on_event()`; hints at `engine/trader/trader.py` (TODO Level 5) |
-| 🏦 | **Toxic flow detection** — identify counterparties who pick you off, stop quoting to them | `team/broker.py → toxic(trader_id)` |
+| 🤖 | **Use stops properly**: venue-held `stop`/`stop_limit` as disaster insurance — and understand why a stop cascade IS the flash crash | `team/trader.py` (send `order_type="stop"`, `stop_price=…`) |
+| 🏦 | **Toxic flow detection** — identify counterparties who pick you off, stop quoting to them. The retail/VWAP background flow gives you a baseline to segment against. | `team/broker.py → toxic(trader_id)` |
+| 🏦 | *(advanced)* **Iceberg quotes** — show small, reload from reserve; the venue only sees the tip | build it client-side: requote a slice on each fill |
 | 🏛 | **Rate limiting**: order-to-trade ratio enforcement + per-team order quotas | `engine/shared/orderbook.py` (TODO Level 5), `engine/exchange/config.py` `MAX_ORDERS_PER_MIN_PER_TEAM` |
+| 🏛 | **Detect the whale**: the institutional VWAP slicer fires on a fixed clock — find it in your venue's flow analytics | `team/exchange.py → on_trade()` |
 
 ## Level 6 — Full markets (Weeks 8–9)
 
@@ -64,6 +67,8 @@ Already working in your starters. Your job is to run it and understand it.
 | 🤖 | ML signal (OPTION E): train offline on recorded sessions, deploy in `on_tick` | `scripts/backtest.py` for data, your model |
 | 🏦 | Multi-exchange quoting from one pricing brain | handled by the SDK — your job is tuning it per venue |
 | 🏛 | **VWAP + analytics endpoint** — broadcast VWAP, expose venue stats worth paying for | `engine/exchange/server.py` (TODO Level 6) |
+| 🏛 | *(advanced)* **Pegged orders** — quotes that track the NBBO midpoint automatically; consume `GET /api/nbbo` | new order type: your venue, your rules |
+| 🤖 | **Auction strategy**: the opening cross publishes indicative price and imbalance every tick — trade the imbalance, or game the close (MOC manipulation is a compliance lecture waiting to happen) | `on_event("AUCTION_INDICATIVE")` |
 
 ---
 

@@ -705,7 +705,12 @@ class TraderBot:
 
     async def _on_session_event(self, msg: SessionEvent) -> None:
         logger.info("Session event: %s — %s", msg.event, msg.message)
-        if msg.event == "SESSION_OPEN":
+        if msg.event == "SESSION_PREOPEN":
+            # Limit orders may rest into the opening auction. Marketable
+            # types are rejected by the venue until the cross.
+            self._session_open = True
+            _console.print("[yellow]◌  Pre-open — auction builds[/yellow]")
+        elif msg.event == "SESSION_OPEN":
             self._session_open = True
             _console.print("[bold green]▶  Session open — trading begins[/bold green]")
         elif msg.event == "SESSION_CLOSED":

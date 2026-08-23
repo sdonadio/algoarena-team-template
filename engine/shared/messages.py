@@ -20,6 +20,7 @@ __all__ = [
     "TeacherCommand",
     "UpgradeRequest",
     "SeatRequest",
+    "ManualOrder",
     # Exchange → Client
     "OrderAck",
     "TradeExecution",
@@ -58,7 +59,13 @@ class PlaceOrder(BaseModel):
     team_id: str
     symbol: str
     side: Literal["buy", "sell"]
-    order_type: Literal["limit", "market", "ioc", "post_only"]
+    order_type: Literal["limit", "market", "ioc", "post_only",
+                        "stop", "stop_limit"]
+    # Stop orders: held by the venue, armed at stop_price. A stop buy fires
+    # when the market trades/marks AT OR ABOVE stop_price (a stop sell at or
+    # below); "stop" then executes as a market order, "stop_limit" as a limit
+    # at `price`. Optional so every existing client stays wire-compatible.
+    stop_price: float | None = None
     price: float
     quantity: int
 
@@ -97,6 +104,27 @@ class UpgradeRequest(BaseModel):
     type: Literal["upgrade_request"] = "upgrade_request"
     team: str          # team NAME as it appears in the roster
     upgrade: str       # catalog key, e.g. "fee_tier"
+    request_id: str = ""   # echoed back on the result, for the portal
+
+
+class ManualOrder(BaseModel):
+    """An order submitted from the team portal's ORDER TICKET.
+
+    Travels the dashboard→exchange relay: the portal verifies the team
+    token over HTTP, the exchange re-validates that the bot belongs to the
+    team, then routes it through the normal order path AS that bot — the
+    fill lands in the bot's portfolio and, if the bot is connected, its
+    process sees the ack and execution like any other.
+    """
+
+    type: Literal["manual_order"] = "manual_order"
+    team: str                                          # roster team NAME
+    bot_id: str                                        # which seat trades
+    symbol: str
+    side: Literal["buy", "sell"]
+    order_type: Literal["limit", "market", "ioc"] = "limit"
+    price: float = 0.0
+    quantity: int = 1
     request_id: str = ""   # echoed back on the result, for the portal
 
 
@@ -240,7 +268,7 @@ class SecurityDef(BaseModel):
 
 AnyClientMessage = Annotated[
     Union[Handshake, PlaceOrder, CancelOrder, TeacherCommand, UpgradeRequest,
-          SeatRequest],
+          SeatRequest, ManualOrder],
     Field(discriminator="type"),
 ]
 
@@ -265,6 +293,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "teacher_command": TeacherCommand,
     "upgrade_request": UpgradeRequest,
     "seat_request": SeatRequest,
+    "manual_order": ManualOrder,
     "order_ack": OrderAck,
     "trade_execution": TradeExecution,
     "book_snapshot": BookSnapshot,

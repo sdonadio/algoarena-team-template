@@ -39,7 +39,11 @@ BASE_SPREAD = 0.30      # e.g. bid = mid - 0.15, ask = mid + 0.15
 # market realistic across a 30x price range. Floor keeps it above the tick.
 MAX_SPREAD_BPS = float(os.environ.get("MAX_SPREAD_BPS", "25"))
 MIN_SPREAD_ABS = float(os.environ.get("MIN_SPREAD_ABS", "0.02"))
-QUOTE_SIZE = 10         # shares/units per side — big enough to survive several fills
+QUOTE_SIZE = 10         # shares at the touch — big enough to survive several fills
+# Book depth: levels per side, each half a spread further out and one
+# QUOTE_SIZE bigger than the last (10 / 20 / 30 by default). Depth is what
+# makes book-imbalance signals readable and market orders walk the ladder.
+QUOTE_LEVELS = int(os.environ.get("QUOTE_LEVELS", "3"))
 REQUOTE_INTERVAL_SEC = 0.5  # how often to refresh quotes (seconds)
 
 # Seconds for the quote centre to close half the gap to the external (Yahoo)

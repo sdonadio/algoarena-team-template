@@ -44,3 +44,16 @@ def _no_scenario_env(monkeypatch):
     monkeypatch.delenv("GAME_WEEK", raising=False)
     monkeypatch.delenv("SCENARIO_PATH", raising=False)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _no_luld_band(monkeypatch):
+    """Disable the LULD price collar for tests by default.
+
+    Most tests pick arbitrary price levels (100.0 on a symbol whose mark
+    is 217) and are about quotas, futures, or matching — not the collar.
+    The collar's own tests set LULD_BAND_PCT back explicitly.
+    """
+    import exchange.config as config
+    monkeypatch.setattr(config, "LULD_BAND_PCT", 0.0)
+    yield

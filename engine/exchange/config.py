@@ -20,6 +20,10 @@ AUTH_REQUIRED = os.environ.get("AUTH_REQUIRED", "false").lower() in ("true", "1"
 # service). Local play keeps the teacher's explicit START.
 SESSION_AUTOOPEN = os.environ.get("SESSION_AUTOOPEN", "false").lower() in ("true", "1", "yes")
 FEE_RATE = float(os.environ.get("ARENA_FEE_RATE", "0.001"))
+# Minimum price increment (Reg NMS Rule 612: one penny). The book snaps
+# incoming prices toward the passive side. Ticks are what make queue
+# priority real — with infinite granularity, pennying is free.
+TICK_SIZE = float(os.environ.get("ARENA_TICK_SIZE", "0.01"))
 
 INITIAL_CASH = 100_000.0          # starting cash for every team
 SNAPSHOT_INTERVAL_SEC = 0.5       # book-snapshot broadcast cadence
@@ -70,6 +74,29 @@ CIRCUIT_BREAKERS_ENABLED = os.environ.get("CIRCUIT_BREAKERS", "false").lower() i
 VELOCITY_WINDOW_SEC   = 60      # lookback window for velocity check (seconds)
 VELOCITY_HALT_PCT     = 0.05    # halt if price moves 5% in VELOCITY_WINDOW_SEC
 SESSION_HALT_PCT      = 0.25    # halt if price moves 25% from session open
+# LULD price band: limit prices further than this from the venue mark are
+# rejected at entry (the erroneous-order collar every real venue runs).
+# Halts stop trading AFTER a move; the band stops the fat-finger PRINT from
+# happening at all. 0 disables.
+LULD_BAND_PCT = float(os.environ.get("LULD_BAND_PCT", "0.10"))
+# Short-sale rule (Rule 201): tripped when a symbol falls this far below the
+# session open; from then on shorts may only rest above the bid. 0 disables.
+SSR_TRIGGER_PCT = float(os.environ.get("SSR_TRIGGER_PCT", "0.10"))
+# Borrow availability: total short interest per symbol across the whole
+# market is capped at this many shares (a locate, in effect). 0 = unlimited.
+SHORT_LOCATE_CAP = int(os.environ.get("SHORT_LOCATE_CAP", "2000"))
+
+# ── Auctions ──────────────────────────────────────────────────────────────────
+# Opening auction: START enters a pre-open of this many ticks — limit orders
+# rest without matching, indicative price/imbalance broadcasts every tick,
+# then one volume-maximizing cross opens the market. 0 = open directly
+# (the historical behavior; local tests and quick demos want this).
+OPENING_AUCTION_TICKS = int(os.environ.get("OPENING_AUCTION_TICKS", "0"))
+# Closing auction: the first close request freezes continuous matching for
+# this many ticks (orders rest into the closing book), then one cross prints
+# the official close and the session ends.
+CLOSING_AUCTION = os.environ.get("CLOSING_AUCTION", "false").lower() in ("true", "1", "yes")
+CLOSING_AUCTION_TICKS = int(os.environ.get("CLOSING_AUCTION_TICKS", "5"))
 HALT_DURATION_SEC     = 300     # default halt duration (5 minutes)
 MARKET_WIDE_L1_PCT    = -0.07   # market-wide Level 1 breaker (-7%)
 MARKET_WIDE_L2_PCT    = -0.13   # market-wide Level 2 breaker (-13%)

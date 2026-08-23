@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import threading
 import time
 from collections import deque
@@ -96,6 +97,9 @@ class BrokerState:
             self.resting_orders.setdefault(sym, {
                 "buy_id": None, "buy_qty": 0,
                 "sell_id": None, "sell_qty": 0,
+                # Every resting level's id (QUOTE_LEVELS per side). buy_id /
+                # sell_id remain the touch level for older readers.
+                "buy_ids": [], "sell_ids": [],
             })
 
     # ------------------------------------------------------------------
@@ -251,14 +255,18 @@ class BrokerBot:
         if msg.team_id != config.TEAM_ID:
             return
         resting = self.state.resting_orders.setdefault(
-            msg.symbol, {"buy_id": None, "buy_qty": 0, "sell_id": None, "sell_qty": 0}
+            msg.symbol, {"buy_id": None, "buy_qty": 0,
+                         "sell_id": None, "sell_qty": 0,
+                         "buy_ids": [], "sell_ids": []}
         )
         if msg.side == "buy":
-            resting["buy_id"]  = msg.order_id
-            resting["buy_qty"] = msg.quantity
+            resting.setdefault("buy_ids", []).append(msg.order_id)
+            if resting["buy_id"] is None:
+                resting["buy_id"] = msg.order_id     # touch level
         else:
-            resting["sell_id"]  = msg.order_id
-            resting["sell_qty"] = msg.quantity
+            resting.setdefault("sell_ids", []).append(msg.order_id)
+            if resting["sell_id"] is None:
+                resting["sell_id"] = msg.order_id
 
     def _on_trade(self, msg: TradeExecution) -> None:
         """Update position and track partial fills."""
@@ -306,7 +314,12 @@ class BrokerBot:
         self.state.spread_income = msg.realized_pnl
 
     async def _on_session_event(self, msg: SessionEvent) -> None:
-        if msg.event == "SESSION_OPEN":
+        if msg.event == "SESSION_PREOPEN":
+            # Quote into the opening auction: orders rest without matching,
+            # and the cross needs a book to clear against.
+            self._session_open = True
+            logger.info("Pre-open — quoting into the opening auction")
+        elif msg.event == "SESSION_OPEN":
             self._session_open = True
             logger.info("Session open — quoting begins")
         elif msg.event == "SESSION_CLOSED":
@@ -421,8 +434,11 @@ class BrokerBot:
         spread = self.state.compute_spread(symbol)
         skew   = self.state.compute_skew(symbol)
         half   = spread / 2
-        bid_price = round(centre - half + skew, 4)
-        ask_price = round(centre + half + skew, 4)
+        # Quote on the penny grid: the venue snaps anyway (buys down, sells
+        # up), so snapping here keeps our tracked quote equal to the resting
+        # one — otherwise every requote decision compares different prices.
+        bid_price = math.floor((centre - half + skew) * 100) / 100
+        ask_price = math.ceil((centre + half + skew) * 100) / 100
 
         if bid_price <= 0 or ask_price <= bid_price:
             logger.debug("Degenerate quote for %s — skipping (centre=%.4f)",
@@ -434,22 +450,35 @@ class BrokerBot:
         if not self._session_open:
             return
 
-        await self._send(PlaceOrder(
-            team_id=config.TEAM_ID, symbol=symbol, side="buy",
-            order_type="limit", price=bid_price, quantity=config.QUOTE_SIZE,
-        ))
-        await self._send(PlaceOrder(
-            team_id=config.TEAM_ID, symbol=symbol, side="sell",
-            order_type="limit", price=ask_price, quantity=config.QUOTE_SIZE,
-        ))
+        # A real book is a LADDER, not a single quote pair: post QUOTE_LEVELS
+        # levels per side, each one half-spread further out and bigger than
+        # the last (the touch is small and tight; depth is cheap and wide).
+        half_step = max(half, 0.01)
+        total_size = 0
+        for lvl in range(config.QUOTE_LEVELS):
+            size = config.QUOTE_SIZE * (lvl + 1)
+            lvl_bid = math.floor((bid_price - lvl * half_step) * 100) / 100
+            lvl_ask = math.ceil((ask_price + lvl * half_step) * 100) / 100
+            if lvl_bid <= 0:
+                continue
+            await self._send(PlaceOrder(
+                team_id=config.TEAM_ID, symbol=symbol, side="buy",
+                order_type="limit", price=lvl_bid, quantity=size,
+            ))
+            await self._send(PlaceOrder(
+                team_id=config.TEAM_ID, symbol=symbol, side="sell",
+                order_type="limit", price=lvl_ask, quantity=size,
+            ))
+            total_size += size
 
         # Track the quote optimistically: the OrderAck fills in the ids we need
         # for cancelling, but the requote decision must not wait for a round
         # trip — otherwise a slow ack means cancel/replacing every cycle again.
         resting = self.state.resting_orders.setdefault(
-            symbol, {"buy_id": None, "buy_qty": 0, "sell_id": None, "sell_qty": 0})
-        resting["buy_qty"] = config.QUOTE_SIZE
-        resting["sell_qty"] = config.QUOTE_SIZE
+            symbol, {"buy_id": None, "buy_qty": 0, "sell_id": None,
+                     "sell_qty": 0, "buy_ids": [], "sell_ids": []})
+        resting["buy_qty"] = total_size
+        resting["sell_qty"] = total_size
         self.state.last_quote_prices[symbol] = centre
         self.state.last_quote_time[symbol] = time.time()
         src = "venue+yahoo" if self.state.yahoo_prices.get(symbol) else "venue"
@@ -459,13 +488,17 @@ class BrokerBot:
     async def cancel_quotes(self, symbol: str) -> None:
         """Cancel the resting bid and ask for one symbol."""
         resting = self.state.resting_orders.get(symbol, {})
-        for id_key, qty_key in (("buy_id", "buy_qty"), ("sell_id", "sell_qty")):
-            order_id = resting.get(id_key)
-            if order_id:
+        for id_key, ids_key, qty_key in (("buy_id", "buy_ids", "buy_qty"),
+                                         ("sell_id", "sell_ids", "sell_qty")):
+            ids = set(resting.get(ids_key) or [])
+            if resting.get(id_key):
+                ids.add(resting[id_key])
+            for order_id in ids:
                 await self._send(CancelOrder(
                     team_id=config.TEAM_ID, order_id=order_id, symbol=symbol,
                 ))
-                resting[id_key] = None
+            resting[id_key] = None
+            resting[ids_key] = []
             resting[qty_key] = 0
         # Nothing is resting, so the next look must quote regardless of moves.
         self.state.last_quote_prices.pop(symbol, None)

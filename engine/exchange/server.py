@@ -22,6 +22,7 @@ import signal
 import socket
 import sys
 import time
+import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -52,6 +53,7 @@ from shared.messages import (
     OrderAck,
     PlaceOrder,
     PortfolioUpdate,
+    ManualOrder,
     SeatRequest,
     SessionEvent,
     TeacherCommand,
@@ -258,7 +260,8 @@ class ExchangeServer:
 
         # One matching engine per listed security.
         self.books: dict[str, OrderBook] = {
-            s.id: OrderBook(s.id, fee_rate=config.FEE_RATE)
+            s.id: OrderBook(s.id, fee_rate=config.FEE_RATE,
+                            tick_size=config.TICK_SIZE)
             for s in self.registry.list_securities()
         }
 
@@ -284,6 +287,22 @@ class ExchangeServer:
         self.circuit_breaker = CircuitBreaker(list(self.books.keys()))
 
         self.session_open: bool = False
+        # Venue-held stop orders: symbol → order_id → entry. Armed, not in
+        # the book; they fire on trade prints or the venue mark crossing
+        # stop_price, then re-enter as market/limit orders. Day orders —
+        # cleared at session close.
+        self.stop_orders: dict[str, dict[str, dict]] = {}
+        # Symbols under the short-sale rule (Rule 201): tripped at
+        # SSR_TRIGGER_PCT below the session open, sticky until the next open.
+        self.ssr_active: set[str] = set()
+        # Auction lifecycle: "preopen" while the opening book builds, else
+        # None. _session_granted keeps the share grant once-per-session
+        # across the two open paths (pre-open grants early).
+        self.auction_phase: str | None = None
+        self.auction_ticks_left: int = 0
+        self._session_granted: bool = False
+        self._pending_close_persist: bool = True
+        self._last_reject_relay: dict[str, float] = {}
         self.tick: int = 0
         # Recent fills, bounded so a multi-hour session cannot exhaust memory.
         # Cumulative counts live in trade_count / part_stats (never trimmed).
@@ -421,6 +440,14 @@ class ExchangeServer:
             # which is only broadcast at the moment the teacher opens. A bot
             # that connects (or crash-reconnects) afterwards would otherwise
             # sit dormant for the whole session.
+            if self.auction_phase == "preopen":
+                await self._send(websocket, SessionEvent(
+                    event="SESSION_PREOPEN",
+                    message="Pre-open in progress — limit orders only.",
+                    data={"symbols": list(self.books.keys()),
+                          "ticks": self.auction_ticks_left,
+                          "late_join": True},
+                ))
             if self.session_open:
                 if new_portfolio and msg.role != "observer":
                     # First appearance mid-session: give the same starting
@@ -469,6 +496,8 @@ class ExchangeServer:
                     await self._handle_upgrade_request(websocket, incoming, team_id)
                 elif isinstance(incoming, SeatRequest):
                     await self._handle_seat_request(websocket, incoming, team_id)
+                elif isinstance(incoming, ManualOrder):
+                    await self._handle_manual_order(websocket, incoming, team_id)
                 else:
                     await self._send(websocket, ErrorMsg(
                         code="UNEXPECTED_MESSAGE",
@@ -498,21 +527,41 @@ class ExchangeServer:
 
         # ── Guard rails ──────────────────────────────────────────────
         if not self.session_open:
-            await self._send(ws, ErrorMsg(
-                code="SESSION_CLOSED",
-                message="Session not open — wait for SESSION_OPEN event",
+            if self.auction_phase in ("preopen", "preclose"):
+                # Auction windows build a book: resting orders only.
+                if msg.order_type not in ("limit", "post_only"):
+                    await self._reject(ws, team_id, ErrorMsg(
+                        code="AUCTION_ONLY_LIMIT",
+                        message=("Pre-open: only limit orders may be entered "
+                                 "into the opening auction"),
+                    ))
+                    return
+            else:
+                await self._reject(ws, team_id, ErrorMsg(
+                    code="SESSION_CLOSED",
+                    message="Session not open — wait for SESSION_OPEN event",
+                ))
+                return
+        elif (self.auction_phase == "preclose"
+                and msg.order_type not in ("limit", "post_only")):
+            # The session is still open during the pre-close, but matching
+            # is frozen: marketable orders would rest at a nonsense price.
+            await self._reject(ws, team_id, ErrorMsg(
+                code="AUCTION_ONLY_LIMIT",
+                message=("Closing auction: only limit orders may be entered "
+                         "into the closing cross"),
             ))
             return
 
         if msg.team_id != team_id:
-            await self._send(ws, ErrorMsg(
+            await self._reject(ws, team_id, ErrorMsg(
                 code="TEAM_MISMATCH",
                 message="team_id in message does not match your authenticated identity",
             ))
             return
 
         if msg.symbol not in self.books:
-            await self._send(ws, ErrorMsg(
+            await self._reject(ws, team_id, ErrorMsg(
                 code="UNKNOWN_SYMBOL",
                 message=f"{msg.symbol!r} is not listed on this exchange",
             ))
@@ -520,7 +569,7 @@ class ExchangeServer:
 
         if self.circuit_breaker.is_halted(msg.symbol):
             remaining = self.circuit_breaker.get_resume_time(msg.symbol)
-            await self._send(ws, ErrorMsg(
+            await self._reject(ws, team_id, ErrorMsg(
                 code="SYMBOL_HALTED",
                 message=(
                     f"{msg.symbol} trading is halted. "
@@ -530,7 +579,7 @@ class ExchangeServer:
             return
 
         if not (1 <= msg.quantity <= config.MAX_ORDER_SIZE):
-            await self._send(ws, ErrorMsg(
+            await self._reject(ws, team_id, ErrorMsg(
                 code="INVALID_QUANTITY",
                 message=f"Quantity must be 1 – {config.MAX_ORDER_SIZE}",
             ))
@@ -538,11 +587,11 @@ class ExchangeServer:
 
         portfolio = self.portfolios.get(team_id)
         if portfolio is None:
-            await self._send(ws, ErrorMsg(code="NO_PORTFOLIO", message="Portfolio not found"))
+            await self._reject(ws, team_id, ErrorMsg(code="NO_PORTFOLIO", message="Portfolio not found"))
             return
 
         if portfolio.role == "observer":
-            await self._send(ws, ErrorMsg(
+            await self._reject(ws, team_id, ErrorMsg(
                 code="FORBIDDEN", message="Observers cannot place orders",
             ))
             return
@@ -552,7 +601,7 @@ class ExchangeServer:
         # permissive, so nothing changes for local play.
         if config.is_future(msg.symbol) and not self.scenario.flag(
                 "futures_enabled"):
-            await self._send(ws, ErrorMsg(
+            await self._reject(ws, team_id, ErrorMsg(
                 code="FUTURES_LOCKED",
                 message=(f"{msg.symbol} is not tradeable yet — the index "
                          f"future lists in week 9 (currently week "
@@ -562,7 +611,7 @@ class ExchangeServer:
 
         if msg.order_type == "post_only" and not self.scenario.flag(
                 "post_only_allowed"):
-            await self._send(ws, ErrorMsg(
+            await self._reject(ws, team_id, ErrorMsg(
                 code="ORDER_TYPE_LOCKED",
                 message=(f"Post-only orders unlock in a later week "
                          f"(week {self.scenario.week}: "
@@ -574,7 +623,7 @@ class ExchangeServer:
         # Real venues meter order traffic. Over quota the order is refused,
         # which is what makes quote lifetime a decision rather than a freebie.
         if not self._take_quota(team_id):
-            await self._send(ws, ErrorMsg(
+            await self._reject(ws, team_id, ErrorMsg(
                 code="RATE_LIMITED",
                 message=(
                     f"Message quota exceeded — you may send "
@@ -586,7 +635,7 @@ class ExchangeServer:
 
         # ── Pre-trade risk checks ─────────────────────────────────────
         if portfolio.liquidated:
-            await self._send(ws, ErrorMsg(
+            await self._reject(ws, team_id, ErrorMsg(
                 code="LIQUIDATED",
                 message="Your account was liquidated — no further trading this session",
             ))
@@ -599,7 +648,7 @@ class ExchangeServer:
         # reduce an existing long.
         if (msg.side == "sell" and worst_pos < 0
                 and not self.scenario.flag("shorts_allowed")):
-            await self._send(ws, ErrorMsg(
+            await self._reject(ws, team_id, ErrorMsg(
                 code="SHORTS_LOCKED",
                 message=(
                     f"Short selling is not unlocked yet (week "
@@ -613,7 +662,7 @@ class ExchangeServer:
         limit = self.position_limit_for(team_id)
         if limit > 0:
             if abs(worst_pos) > limit:
-                await self._send(ws, ErrorMsg(
+                await self._reject(ws, team_id, ErrorMsg(
                     code="POSITION_LIMIT",
                     message=(
                         f"Order would take {msg.symbol} position to {worst_pos:+d} "
@@ -629,7 +678,7 @@ class ExchangeServer:
             needed = abs(worst_pos) * config.FUTURES_MARGIN_PER_CONTRACT \
                 - abs(cur) * config.FUTURES_MARGIN_PER_CONTRACT
             if needed > 0 and free_cash < needed:
-                await self._send(ws, ErrorMsg(
+                await self._reject(ws, team_id, ErrorMsg(
                     code="INSUFFICIENT_MARGIN",
                     message=(
                         f"{msg.symbol} needs ${needed:,.2f} additional margin "
@@ -661,7 +710,7 @@ class ExchangeServer:
                 )
 
             if buying_power < est_cost:
-                await self._send(ws, ErrorMsg(
+                await self._reject(ws, team_id, ErrorMsg(
                     code="INSUFFICIENT_CASH",
                     message=(
                         f"Estimated cost ${est_cost:,.2f}, "
@@ -671,7 +720,85 @@ class ExchangeServer:
                 return
         # Sell orders may create short positions (market makers must be able
         # to post ask quotes before receiving fills). Shorts pay a per-tick
-        # borrow fee and count against the position limit above.
+        # borrow fee and count against the position limit above — plus two
+        # real-market brakes: the short-sale rule and borrow availability.
+        if (msg.side == "sell" and not config.is_future(msg.symbol)):
+            pos = portfolio.positions.get(msg.symbol, 0)
+            new_short = max(0, msg.quantity - max(pos, 0))
+            if new_short > 0:
+                # SSR (Rule 201): once a symbol is down SSR_TRIGGER_PCT from
+                # the open, shorts may only ADD liquidity above the bid —
+                # no hitting bids on the way down.
+                if msg.symbol in self.ssr_active:
+                    best_bid = self.books[msg.symbol].best_bid()
+                    passive = (msg.order_type in ("limit", "post_only")
+                               and (best_bid is None or msg.price > best_bid))
+                    if not passive:
+                        await self._reject(ws, team_id, ErrorMsg(
+                            code="SSR_RESTRICTED",
+                            message=(f"{msg.symbol} is under the short-sale "
+                                     f"rule (down {config.SSR_TRIGGER_PCT:.0%}"
+                                     f" from open) — shorts must be limit "
+                                     f"orders priced above the best bid"),
+                        ))
+                        return
+                # Borrow locate: total short interest per symbol is capped.
+                cap = config.SHORT_LOCATE_CAP
+                if cap > 0:
+                    outstanding = sum(
+                        max(0, -p.positions.get(msg.symbol, 0))
+                        for p in self.portfolios.values())
+                    if outstanding + new_short > cap:
+                        await self._reject(ws, team_id, ErrorMsg(
+                            code="BORROW_UNAVAILABLE",
+                            message=(f"No borrow: {outstanding} of {cap} "
+                                     f"{msg.symbol} shares already short "
+                                     f"across the market"),
+                        ))
+                        return
+
+        # ── LULD price band (erroneous-order collar) ──────────────────
+        # A limit price too far from the venue mark is rejected at entry:
+        # the halt layers react AFTER a bad print; the band prevents it.
+        # Market orders carry no price, and a stop's limit is checked when
+        # it fires (it re-enters here as a plain limit).
+        if (config.LULD_BAND_PCT > 0
+                and msg.order_type in ("limit", "ioc", "post_only")):
+            ref = self.ref_prices.get(msg.symbol)
+            if ref and ref > 0:
+                lo = ref * (1 - config.LULD_BAND_PCT)
+                hi = ref * (1 + config.LULD_BAND_PCT)
+                if not (lo <= msg.price <= hi):
+                    await self._reject(ws, team_id, ErrorMsg(
+                        code="PRICE_BAND",
+                        message=(f"{msg.symbol} {msg.side} at {msg.price} is "
+                                 f"outside the LULD band "
+                                 f"[{lo:.2f}, {hi:.2f}] around the mark "
+                                 f"{ref:.2f} — rejected"),
+                    ))
+                    return
+
+        # ── Stop orders: armed at the venue, not matched now ──────────
+        if msg.order_type in ("stop", "stop_limit"):
+            if not msg.stop_price or msg.stop_price <= 0:
+                await self._reject(ws, team_id, ErrorMsg(
+                    code="STOP_PRICE_REQUIRED",
+                    message="stop/stop_limit orders need stop_price > 0",
+                ))
+                return
+            oid = f"stop-{uuid.uuid4()}"
+            self.stop_orders.setdefault(msg.symbol, {})[oid] = {
+                "order_id": oid, "team_id": team_id, "symbol": msg.symbol,
+                "side": msg.side, "stop_price": float(msg.stop_price),
+                "price": float(msg.price), "quantity": int(msg.quantity),
+                "order_type": msg.order_type,
+            }
+            await self._send(ws, OrderAck(
+                order_id=oid, team_id=team_id, symbol=msg.symbol,
+                side=msg.side, price=float(msg.stop_price),
+                quantity=msg.quantity,
+            ))
+            return
 
         # ── Match ────────────────────────────────────────────────────
         book = self.books[msg.symbol]
@@ -691,6 +818,19 @@ class ExchangeServer:
             ))
             return
 
+        # Self-trade prevention: tell the owner its resting order was
+        # cancelled rather than matched against its own incoming order.
+        for cancelled in book.stp_cancels:
+            owner_ws = self.clients.get(cancelled.team_id)
+            if owner_ws:
+                await self._send(owner_ws, ErrorMsg(
+                    code="STP_CANCEL",
+                    message=(f"Your resting {cancelled.side} "
+                             f"{cancelled.remaining} {cancelled.symbol} @ "
+                             f"{cancelled.price} was cancelled by self-trade "
+                             f"prevention (your own order crossed it)"),
+                ))
+
         await self._send(ws, OrderAck(
             order_id=order.order_id,
             team_id=team_id,
@@ -702,6 +842,63 @@ class ExchangeServer:
 
         for trade in trades:
             await self._process_trade(trade)
+        if trades:
+            await self._check_stop_triggers(msg.symbol, trades[-1].price)
+
+    async def _reject(self, ws, team_id: str, err) -> None:
+        """Send a rejection to the bot AND surface it to the teacher relay.
+
+        A student whose orders are silently dying in their bot's console
+        burns lab time not knowing they are being throttled/banded/halted.
+        The relay copy (throttled to one per bot per second — a rate-limited
+        bot would otherwise flood it) reaches the dashboard's market log and
+        the team's portal event feed.
+        """
+        await self._send(ws, err)
+        now = time.time()
+        if now - self._last_reject_relay.get(team_id, 0.0) < 1.0:
+            return
+        self._last_reject_relay[team_id] = now
+        for teacher in self.teacher_clients:
+            tws = self.clients.get(teacher)
+            if tws:
+                await self._send(tws, SessionEvent(
+                    event="ORDER_REJECT",
+                    message=f"{team_id}: [{err.code}] {err.message}",
+                    data={"bot": team_id, "code": err.code,
+                          "detail": err.message},
+                ))
+
+    async def _check_stop_triggers(self, symbol: str, last_price: float) -> None:
+        """Fire armed stops crossed by a print or the venue mark.
+
+        Fired entries are removed BEFORE re-injection, so the recursion a
+        triggered stop causes (its own fills re-enter here) terminates.
+        """
+        pending = self.stop_orders.get(symbol)
+        if not pending:
+            return
+        fired = [e for e in pending.values()
+                 if (e["side"] == "buy" and last_price >= e["stop_price"])
+                 or (e["side"] == "sell" and last_price <= e["stop_price"])]
+        for entry in fired:
+            pending.pop(entry["order_id"], None)
+            owner_ws = self.clients.get(entry["team_id"])
+            if owner_ws:
+                await self._send(owner_ws, SessionEvent(
+                    event="STOP_TRIGGERED",
+                    message=(f"Stop {entry['side']} {entry['quantity']} "
+                             f"{symbol} armed at {entry['stop_price']} "
+                             f"triggered at {last_price:.2f}"),
+                    data={"order_id": entry["order_id"], "symbol": symbol,
+                          "trigger_price": last_price},
+                ))
+            await self._handle_place_order(owner_ws, PlaceOrder(
+                team_id=entry["team_id"], symbol=symbol, side=entry["side"],
+                order_type=("market" if entry["order_type"] == "stop"
+                            else "limit"),
+                price=entry["price"], quantity=entry["quantity"],
+            ), entry["team_id"])
 
     async def _handle_cancel_order(
         self, ws: Any, msg: CancelOrder, team_id: str
@@ -734,6 +931,13 @@ class ExchangeServer:
                     f"{self.quota_for(team_id):.0f} order/cancel messages per tick"
                 ),
             ))
+            return
+
+        # Armed stops live at the venue, not in the book — check them first.
+        armed = self.stop_orders.get(msg.symbol, {})
+        entry = armed.get(msg.order_id)
+        if entry is not None and entry["team_id"] == team_id:
+            del armed[msg.order_id]
             return
 
         cancelled = book.cancel_order(msg.order_id, team_id)
@@ -918,6 +1122,89 @@ class ExchangeServer:
     # ------------------------------------------------------------------
     # Seat purchases (Phase 10: grow the firm)
     # ------------------------------------------------------------------
+
+    class _CaptureWS:
+        """Collects what the order path would send, for the ticket result."""
+
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+
+        async def send(self, payload: str) -> None:
+            self.sent.append(payload)
+
+    async def _handle_manual_order(
+        self, ws: Any, msg: ManualOrder, team_id: str
+    ) -> None:
+        """An ORDER TICKET submission from the team portal.
+
+        Same trust model as upgrades/seats: the portal verified the team
+        token over HTTP and forwards on the teacher relay; the exchange
+        re-validates that the bot belongs to the team, then runs the NORMAL
+        order path as that bot — every guard (band, SSR, halts, cash,
+        quota) applies exactly as it would to the bot's own order.
+        """
+        if team_id not in self.teacher_clients:
+            await self._send(ws, ErrorMsg(
+                code="FORBIDDEN",
+                message="Manual orders must come through the team portal",
+            ))
+            return
+
+        if msg.bot_id not in upgrades.team_bots(msg.team):
+            await self._send(ws, SessionEvent(
+                event="MANUAL_ORDER_RESULT",
+                message=f"{msg.bot_id!r} is not one of {msg.team}'s bots",
+                data={"ok": False, "request_id": msg.request_id,
+                      "error": f"{msg.bot_id!r} is not one of your bots"},
+            ))
+            return
+
+        # The whole point of the ticket is trying the market BEFORE your
+        # bot runs — create the portfolio on demand, exactly as the
+        # handshake would (allocated capital + the session's share grant).
+        if msg.bot_id not in self.portfolios:
+            cfg = config._read_roster().get(msg.team) or {}
+            import shared.roster as roster_shape
+            role = ("broker" if msg.bot_id in roster_shape.broker_ids_of(cfg)
+                    else "trader")
+            portfolio = Portfolio(
+                team_id=msg.bot_id, role=role, level=1,
+                cash=config.starting_cash_for(msg.bot_id))
+            self.portfolios[msg.bot_id] = portfolio
+            n = config.STARTING_SHARES_PER_SYMBOL
+            if self.session_open and self._session_granted and n > 0:
+                for sym in self.books:
+                    if not config.is_future(sym):
+                        portfolio.positions[sym] = n
+                        portfolio.avg_cost[sym] = self.ref_prices.get(sym, 0.0)
+
+        capture = self._CaptureWS()
+        await self._handle_place_order(capture, PlaceOrder(
+            team_id=msg.bot_id, symbol=msg.symbol, side=msg.side,
+            order_type=msg.order_type, price=msg.price,
+            quantity=msg.quantity,
+        ), msg.bot_id)
+
+        # Forward everything to the bot's live connection too, then build
+        # the ticket verdict from what the order path actually said.
+        bot_ws = self.clients.get(msg.bot_id)
+        result: dict = {"ok": True, "request_id": msg.request_id}
+        detail = f"{msg.side} {msg.quantity} {msg.symbol} submitted"
+        for payload in capture.sent:
+            if bot_ws:
+                await self._send_payload(msg.bot_id, bot_ws, payload)
+            data = json.loads(payload)
+            if data.get("type") == "error":
+                result = {"ok": False, "request_id": msg.request_id,
+                          "error": f"[{data.get('code')}] {data.get('message')}"}
+                detail = result["error"]
+                break
+            if data.get("type") == "order_ack":
+                detail = (f"Order accepted: {msg.side} {msg.quantity} "
+                          f"{msg.symbol} @ {data.get('price')}")
+        result["detail"] = detail
+        await self._send(ws, SessionEvent(
+            event="MANUAL_ORDER_RESULT", message=detail, data=result))
 
     async def _handle_seat_request(
         self, ws: Any, msg: SeatRequest, team_id: str
@@ -1239,6 +1526,52 @@ class ExchangeServer:
 
             engine.update_fair_value(fair)
             self.ref_prices[sym] = engine.tick()
+
+        # Auction countdowns: broadcast the indicative cross each tick,
+        # then run the cross when the clock reaches zero.
+        if self.auction_phase == "preclose":
+            self.auction_ticks_left -= 1
+            if self.auction_ticks_left <= 0:
+                await self._run_closing_cross()
+        if self.auction_phase == "preopen":
+            self.auction_ticks_left -= 1
+            if self.auction_ticks_left <= 0:
+                await self._run_opening_cross()
+            else:
+                indicative = {s: v for s, v in
+                              ((sym, b.auction_preview())
+                               for sym, b in self.books.items()) if v}
+                await self._broadcast(SessionEvent(
+                    event="AUCTION_INDICATIVE",
+                    message=(f"Opening cross in "
+                             f"{self.auction_ticks_left} ticks"),
+                    data={"ticks_left": self.auction_ticks_left,
+                          "symbols": indicative},
+                ))
+
+        # Armed stops also fire on the venue mark, not only on prints — a
+        # gap with no trades must still take a student out of a position.
+        if self.session_open:
+            for sym in [s for s, pend in self.stop_orders.items() if pend]:
+                mark = self.ref_prices.get(sym)
+                if mark:
+                    await self._check_stop_triggers(sym, mark)
+
+        # Short-sale rule triggers: down SSR_TRIGGER_PCT from the open.
+        if self.session_open and config.SSR_TRIGGER_PCT > 0:
+            for sym, engine in self.price_engines.items():
+                if (sym not in self.ssr_active
+                        and not config.is_future(sym)
+                        and engine.session_return() <= -config.SSR_TRIGGER_PCT):
+                    self.ssr_active.add(sym)
+                    logger.info("SSR ON  %s (down %.1f%% from open)",
+                                sym, engine.session_return() * -100)
+                    await self._broadcast(SessionEvent(
+                        event="SSR_ON",
+                        message=(f"{sym} is now under the short-sale rule — "
+                                 f"shorts must add liquidity above the bid"),
+                        data={"symbol": sym},
+                    ))
 
         # Calendar: announce, fire, and advance any ramp in progress. Runs
         # after the price blend so a ramp's fair value is not averaged away.
@@ -1734,39 +2067,121 @@ class ExchangeServer:
     async def open_session(self) -> None:
         """Open the trading session — all connected bots activate.
 
-        Idempotent: a second START while open is a no-op. Without the guard
-        every re-click re-granted STARTING_SHARES to every participant —
-        free inventory minted by a teacher double-click.
+        Idempotent: a second START while open (or opening) is a no-op.
+        With OPENING_AUCTION_TICKS > 0, START first enters a pre-open:
+        limit orders rest without matching, indicative price/imbalance
+        broadcasts each tick, then one single-price cross opens the market.
         """
-        if self.session_open:
-            logger.info("open_session ignored — session already open")
+        if self.session_open or self.auction_phase:
+            logger.info("open_session ignored — session already open/opening")
             return
+        if config.OPENING_AUCTION_TICKS > 0:
+            self.auction_phase = "preopen"
+            self.auction_ticks_left = config.OPENING_AUCTION_TICKS
+            for book in self.books.values():
+                book.auction_mode = True
+            # Shares are granted at the PRE-open: the opening auction only
+            # means something if participants have inventory to sell into it.
+            await self._grant_starting_shares()
+            logger.info("━━━  PRE-OPEN  ━━━  opening cross in %d ticks",
+                        self.auction_ticks_left)
+            await self._broadcast(SessionEvent(
+                event="SESSION_PREOPEN",
+                message=(f"Pre-open: limit orders only — the opening "
+                         f"auction crosses in {self.auction_ticks_left} "
+                         f"ticks"),
+                data={"symbols": list(self.books.keys()),
+                      "ticks": self.auction_ticks_left},
+            ))
+            return
+        await self._complete_open()
+
+    async def _grant_starting_shares(self) -> None:
+        """Give every trading participant the session's starting shares.
+
+        Runs at most once per session, whichever path (pre-open or direct
+        open) reaches it first. Observers never trade — granting them
+        shares only distorts the visible share supply.
+        """
+        if self._session_granted:
+            return
+        self._session_granted = True
+        n = config.STARTING_SHARES_PER_SYMBOL
+        if n <= 0:
+            return
+        for portfolio in self.portfolios.values():
+            if portfolio.role == "observer":
+                continue
+            for sym in self.books:
+                # Futures are contracts, not shares — nothing to grant.
+                if config.is_future(sym):
+                    continue
+                portfolio.positions[sym] = portfolio.positions.get(sym, 0) + n
+                if sym not in portfolio.avg_cost:
+                    portfolio.avg_cost[sym] = self.ref_prices.get(sym, 0.0)
+            ws = self.clients.get(portfolio.team_id)
+            if ws:
+                await self._send(ws, portfolio.to_message(self.ref_prices))
+        logger.info("Starting shares distributed: %d per symbol to %d participants",
+                    n, len(self.portfolios))
+
+    async def _run_opening_cross(self) -> None:
+        """Cross every book at its clearing price, then open the market."""
+        results: dict[str, dict] = {}
+        for sym, book in self.books.items():
+            book.auction_mode = False
+            trades = book.auction_execute()
+            if trades:
+                results[sym] = {"price": trades[-1].price,
+                                "volume": sum(t.quantity for t in trades)}
+            for trade in trades:
+                await self._process_trade(trade)
+        self.auction_phase = None
+        if results:
+            logger.info("OPENING CROSS  %s",
+                        "  ".join(f"{s} {r['volume']}@{r['price']:.2f}"
+                                  for s, r in results.items()))
+        await self._complete_open()
+        await self._broadcast(SessionEvent(
+            event="AUCTION_RESULT",
+            message="Opening auction complete — continuous trading begins",
+            data={"phase": "open", "symbols": results},
+        ))
+
+    async def _run_closing_cross(self) -> None:
+        """Cross every book once, then finish the deferred close."""
+        results: dict[str, dict] = {}
+        for sym, book in self.books.items():
+            book.auction_mode = False
+            trades = book.auction_execute()
+            if trades:
+                results[sym] = {"price": trades[-1].price,
+                                "volume": sum(t.quantity for t in trades)}
+            for trade in trades:
+                await self._process_trade(trade)
+        if results:
+            logger.info("CLOSING CROSS  %s",
+                        "  ".join(f"{s} {r['volume']}@{r['price']:.2f}"
+                                  for s, r in results.items()))
+        await self._broadcast(SessionEvent(
+            event="AUCTION_RESULT",
+            message="Closing auction complete",
+            data={"phase": "close", "symbols": results},
+        ))
+        # auction_phase is still "preclose" here ON PURPOSE: close_session
+        # only opens the pre-close window when the phase is None, so this
+        # call falls through to the real close (which resets the phase).
+        await self.close_session(persist=self._pending_close_persist)
+
+    async def _complete_open(self) -> None:
         self.session_open = True
+        self.ssr_active.clear()       # a new day clears the short-sale rule
         self._last_season_save = time.time()
         self._start_recording()
         for engine in self.price_engines.values():
             engine.session_open = engine.market_price
 
-        # Distribute starting shares to every trading participant.
-        # Observers (dashboards, probes) never trade — granting them shares
-        # only distorts the visible share supply.
-        n = config.STARTING_SHARES_PER_SYMBOL
-        if n > 0:
-            for portfolio in self.portfolios.values():
-                if portfolio.role == "observer":
-                    continue
-                for sym in self.books:
-                    # Futures are contracts, not shares — nothing to grant.
-                    if config.is_future(sym):
-                        continue
-                    portfolio.positions[sym] = portfolio.positions.get(sym, 0) + n
-                    if sym not in portfolio.avg_cost:
-                        portfolio.avg_cost[sym] = self.ref_prices.get(sym, 0.0)
-                ws = self.clients.get(portfolio.team_id)
-                if ws:
-                    await self._send(ws, portfolio.to_message(self.ref_prices))
-            logger.info("Starting shares distributed: %d per symbol to %d participants",
-                        n, len(self.portfolios))
+        await self._grant_starting_shares()
 
         # First snapshot of the session: the baseline every season return is
         # measured from (taken after the share grant, so the free inventory
@@ -1784,7 +2199,8 @@ class ExchangeServer:
             event="SESSION_OPEN",
             message="Trading session is now OPEN. Bots activate!",
             data={"symbols": list(self.books.keys()), "tick": self.tick,
-                  "starting_shares": n, "week": self.scenario.week,
+                  "starting_shares": config.STARTING_SHARES_PER_SYMBOL,
+                  "week": self.scenario.week,
                   "scenario": self.scenario.to_dict()},
         ))
 
@@ -1795,8 +2211,36 @@ class ExchangeServer:
         command is the explicit "bank this week" action; plain
         `close_session` keeps working as it always has.
         """
+        # Closing auction: mirror of the pre-open. The first close request
+        # freezes continuous matching for CLOSING_AUCTION_TICKS — orders
+        # rest into the closing book, the indicative cross broadcasts — and
+        # advance_tick runs the cross, then finishes the close for real.
+        if (config.CLOSING_AUCTION and self.session_open
+                and self.auction_phase is None):
+            self.auction_phase = "preclose"
+            self.auction_ticks_left = config.CLOSING_AUCTION_TICKS
+            self._pending_close_persist = persist
+            for book in self.books.values():
+                book.auction_mode = True
+            logger.info("━━━  PRE-CLOSE  ━━━  closing cross in %d ticks",
+                        self.auction_ticks_left)
+            await self._broadcast(SessionEvent(
+                event="SESSION_PRECLOSE",
+                message=(f"Closing auction: limit orders only — the market "
+                         f"closes on the cross in "
+                         f"{self.auction_ticks_left} ticks"),
+                data={"ticks": self.auction_ticks_left},
+            ))
+            return
+
         was_open = self.session_open
         self.session_open = False
+        self.auction_phase = None
+        self.auction_ticks_left = 0
+        self._session_granted = False
+        for book in self.books.values():
+            book.auction_mode = False
+        self.stop_orders.clear()      # stops are day orders
         if was_open:
             self.snapshot_equity(force=True)
             self.sessions_played += 1

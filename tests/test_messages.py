@@ -110,8 +110,21 @@ class TestPlaceOrder:
         with pytest.raises(ValidationError):
             PlaceOrder(
                 team_id="t1", symbol="X", side="buy",
-                order_type="stop", price=1.0, quantity=1,
+                order_type="teleport", price=1.0, quantity=1,
             )
+
+    def test_stop_order_round_trip(self):
+        msg = PlaceOrder(team_id="t1", symbol="AAPL", side="sell",
+                         order_type="stop_limit", price=194.0, quantity=10,
+                         stop_price=195.0)
+        again = PlaceOrder.model_validate_json(msg.model_dump_json())
+        assert again.stop_price == pytest.approx(195.0)
+        assert again.order_type == "stop_limit"
+
+    def test_stop_price_is_optional_for_wire_compat(self):
+        raw = ('{"type":"place_order","team_id":"t1","symbol":"X",'
+               '"side":"buy","order_type":"limit","price":1.0,"quantity":1}')
+        assert PlaceOrder.model_validate_json(raw).stop_price is None
 
     def test_missing_quantity(self):
         with pytest.raises(ValidationError):

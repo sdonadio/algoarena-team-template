@@ -525,3 +525,91 @@ class TestDataclassFields:
         _, trades2 = place_buy(ob2, "b", 102.0, 10)
         ids = [t.trade_id for t in trades2]
         assert len(ids) == len(set(ids))
+
+
+# ── Self-trade prevention (cancel-resting) ────────────────────────────────────
+
+class TestSelfTradePrevention:
+    def test_own_orders_never_match(self):
+        book = OrderBook("AAPL")
+        resting, _ = book.place_order("me", "sell", 100.0, 5)
+        order, trades = book.place_order("me", "buy", 101.0, 5)
+        assert trades == []
+        assert [o.order_id for o in book.stp_cancels] == [resting.order_id]
+        # The resting ask is gone; the incoming buy now rests alone.
+        assert book.best_ask() is None
+        assert book.best_bid() == 101.0
+
+    def test_matching_continues_past_own_order(self):
+        book = OrderBook("AAPL")
+        book.place_order("me", "sell", 100.0, 5)      # own — will be cancelled
+        book.place_order("them", "sell", 100.5, 5)    # next level — real fill
+        order, trades = book.place_order("me", "buy", 101.0, 5)
+        assert len(trades) == 1
+        assert trades[0].seller_id == "them"
+        assert trades[0].price == pytest.approx(100.5)
+        assert len(book.stp_cancels) == 1
+
+    def test_partial_own_shield_in_the_middle(self):
+        book = OrderBook("AAPL")
+        book.place_order("them", "sell", 100.0, 3)
+        book.place_order("me", "sell", 100.5, 3)
+        book.place_order("them2", "sell", 101.0, 3)
+        _, trades = book.place_order("me", "buy", 101.0, 9)
+        assert [t.seller_id for t in trades] == ["them", "them2"]
+        assert sum(t.quantity for t in trades) == 6
+        assert len(book.stp_cancels) == 1
+
+    def test_firm_level_scope_via_stp_key(self):
+        team = {"a_trader": "A", "a_broker": "A", "b_trader": "B"}
+        book = OrderBook("AAPL", stp_key=lambda t: team.get(t, t))
+        book.place_order("a_broker", "sell", 100.0, 5)
+        _, trades = book.place_order("a_trader", "buy", 101.0, 5)
+        assert trades == [] and len(book.stp_cancels) == 1
+        _, trades = book.place_order("b_trader", "buy", 101.0, 5)
+        assert trades == []   # book emptied by the STP cancel above
+
+    def test_stp_cancels_reset_each_call(self):
+        book = OrderBook("AAPL")
+        book.place_order("me", "sell", 100.0, 5)
+        book.place_order("me", "buy", 101.0, 5)
+        assert len(book.stp_cancels) == 1
+        book.place_order("other", "buy", 99.0, 1)
+        assert book.stp_cancels == []
+
+
+# ── Tick size (Reg NMS Rule 612) ──────────────────────────────────────────────
+
+class TestTickSize:
+    def test_snap_toward_the_passive_side(self):
+        book = OrderBook("AAPL", tick_size=0.01)
+        assert book.snap_to_tick(100.234, "buy") == pytest.approx(100.23)
+        assert book.snap_to_tick(100.234, "sell") == pytest.approx(100.24)
+        assert book.snap_to_tick(100.23, "buy") == pytest.approx(100.23)
+        assert book.snap_to_tick(100.23, "sell") == pytest.approx(100.23)
+
+    def test_orders_rest_and_trade_on_the_grid(self):
+        book = OrderBook("AAPL", tick_size=0.01)
+        book.place_order("m", "sell", 100.0049, 5)      # rests at 100.01
+        assert book.best_ask() == pytest.approx(100.01)
+        _, trades = book.place_order("t", "buy", 100.0151, 5)  # snapped to 100.01
+        assert len(trades) == 1
+        assert trades[0].price == pytest.approx(100.01)
+
+    def test_sub_tick_price_becomes_one_tick(self):
+        book = OrderBook("PENNY", tick_size=0.01)
+        order, _ = book.place_order("t", "buy", 0.003, 1)
+        assert order.price == pytest.approx(0.01)
+
+    def test_zero_tick_disables_snapping(self):
+        book = OrderBook("AAPL")                         # pure-logic default
+        order, _ = book.place_order("t", "buy", 100.1234, 1)
+        assert order.price == pytest.approx(100.1234)
+
+    def test_snapping_cannot_make_an_order_more_aggressive(self):
+        book = OrderBook("AAPL", tick_size=0.01)
+        book.place_order("m", "sell", 100.24, 5)
+        # Buyer asked 100.238 — below the ask; snapping down must not cross.
+        _, trades = book.place_order("t", "buy", 100.238, 5)
+        assert trades == []
+        assert book.best_bid() == pytest.approx(100.23)

@@ -12,12 +12,17 @@ Matching rules:
   - IOC orders fill at limit price or better; remainder is cancelled
   - Post-only orders rest without ever crossing; rejected if they would
     (guarantees the maker rebate under the maker/taker fee model)
+  - Self-trade prevention (cancel-resting): an order never matches a resting
+    order with the same STP key (the bot id by default). The resting order is
+    cancelled and matching continues — exactly how real venues implement STP,
+    and what makes wash trades impossible.
   - Fee is fee_rate × notional, split 50/50 between buyer and seller
 """
 
 from __future__ import annotations
 
 import heapq
+import math
 import time
 import uuid
 from dataclasses import dataclass
@@ -54,9 +59,30 @@ class Trade:
 class OrderBook:
     """Per-symbol CLOB with price-time priority matching and lazy heap deletion."""
 
-    def __init__(self, symbol: str, fee_rate: float = 0.001) -> None:
+    def __init__(self, symbol: str, fee_rate: float = 0.001,
+                 stp_key=None, tick_size: float = 0.0) -> None:
         self.symbol = symbol
         self.fee_rate = fee_rate
+
+        # Minimum price increment (Reg NMS Rule 612: a penny for equities).
+        # Incoming prices are snapped toward the passive side — buys round
+        # DOWN, sells round UP — so an order is never more aggressive than
+        # the sender intended. 0.0 disables snapping (pure-logic default;
+        # the exchange passes its configured tick).
+        self.tick_size = tick_size
+
+        # Self-trade prevention scope: two orders whose team_ids map to the
+        # same key never trade with each other. Identity (bot-level) by
+        # default; pass e.g. a roster team-of-bot resolver for firm-level.
+        self._stp_key = stp_key or (lambda team_id: team_id)
+        # Resting orders cancelled by STP during the LAST place_order call —
+        # the caller reads this to notify the cancelled order's owner.
+        self.stp_cancels: list[Order] = []
+
+        # Auction mode (pre-open): orders REST without matching; the book
+        # crosses once at a single volume-maximizing price via
+        # auction_execute(). Continuous matching resumes when cleared.
+        self.auction_mode = False
 
         # Min-heaps for fast best-price access (entries are deleted lazily).
         #   _bids: (-price, timestamp, order_id)  →  highest price pops first
@@ -90,6 +116,9 @@ class OrderBook:
         opposite side, the order is returned with rejected=True and no fills.
         """
         # TODO Level 5: Order-to-trade ratio enforcement
+        self.stp_cancels = []
+        if order_type != "market":            # market orders carry no price
+            price = self.snap_to_tick(price, side)
         now = time.time()
         order = Order(
             order_id=str(uuid.uuid4()),
@@ -102,6 +131,16 @@ class OrderBook:
             timestamp=now,
             order_type=order_type,
         )
+
+        if self.auction_mode:
+            # Pre-open: everything rests, nothing matches. The caller
+            # rejects non-limit types before they get here.
+            self._orders[order.order_id] = order
+            if side == "buy":
+                heapq.heappush(self._bids, (-order.price, now, order.order_id))
+            else:
+                heapq.heappush(self._asks, (order.price, now, order.order_id))
+            return order, []
 
         if order_type == "post_only":
             opp = self.best_ask() if side == "buy" else self.best_bid()
@@ -218,6 +257,121 @@ class OrderBook:
         return (bid_vol - ask_vol) / total
 
     # ------------------------------------------------------------------
+    # Auctions — single-price cross (opening / closing)
+    # ------------------------------------------------------------------
+
+    def auction_preview(self) -> dict | None:
+        """The indicative auction outcome for the current resting book.
+
+        Returns {"price", "volume", "imbalance"} — the volume-maximizing
+        clearing price, the shares that would cross there, and the signed
+        surplus (buy demand − sell supply, positive = buy pressure) — or
+        None if nothing would cross. Non-mutating: this is the indicative
+        feed venues publish during the pre-open.
+        """
+        bids = sorted((o for o in self._orders.values() if o.side == "buy"),
+                      key=lambda o: (-o.price, o.timestamp))
+        asks = sorted((o for o in self._orders.values() if o.side == "sell"),
+                      key=lambda o: (o.price, o.timestamp))
+        if not bids or not asks or bids[0].price < asks[0].price:
+            return None
+
+        candidates = sorted({o.price for o in bids} | {o.price for o in asks})
+        best = None
+        for p in candidates:
+            demand = sum(o.remaining for o in bids if o.price >= p)
+            supply = sum(o.remaining for o in asks if o.price <= p)
+            volume = min(demand, supply)
+            if volume <= 0:
+                continue
+            surplus = demand - supply
+            key = (volume, -abs(surplus))     # max volume, then min imbalance
+            if best is None or key > best[0]:
+                best = (key, p, volume, surplus)
+        if best is None:
+            return None
+        _, price, volume, surplus = best
+        return {"price": self.snap_to_tick(price, "sell" if surplus >= 0
+                                           else "buy"),
+                "volume": volume, "imbalance": surplus}
+
+    def auction_execute(self) -> list[Trade]:
+        """Cross the resting book once at the single clearing price.
+
+        Eligible bids (price ≥ clearing) meet eligible asks (price ≤
+        clearing) in price-time priority; every trade prints AT the
+        clearing price. Unexecuted remainder keeps resting for continuous
+        trading. Self-matches are skipped (STP), never printed.
+        """
+        preview = self.auction_preview()
+        if preview is None:
+            return []
+        clearing = preview["price"]
+        now = time.time()
+        trades: list[Trade] = []
+        aggressor: Literal["buy", "sell"] = (
+            "buy" if preview["imbalance"] >= 0 else "sell")
+
+        bids = [o for o in sorted(self._orders.values(),
+                                  key=lambda o: (-o.price, o.timestamp))
+                if o.side == "buy" and o.price >= clearing]
+        asks = [o for o in sorted(self._orders.values(),
+                                  key=lambda o: (o.price, o.timestamp))
+                if o.side == "sell" and o.price <= clearing]
+
+        bi = 0
+        for ask in asks:
+            while ask.remaining > 0 and bi < len(bids):
+                bid = bids[bi]
+                if bid.remaining == 0:
+                    bi += 1
+                    continue
+                if self._stp_key(bid.team_id) == self._stp_key(ask.team_id):
+                    # Never print a self-match; try the next bid for this ask.
+                    swapped = next(
+                        (j for j in range(bi + 1, len(bids))
+                         if bids[j].remaining > 0
+                         and self._stp_key(bids[j].team_id)
+                         != self._stp_key(ask.team_id)), None)
+                    if swapped is None:
+                        break
+                    bid = bids[swapped]
+                fill = min(bid.remaining, ask.remaining)
+                bid.remaining -= fill
+                ask.remaining -= fill
+                notional = clearing * fill
+                trades.append(Trade(
+                    trade_id=str(uuid.uuid4()), symbol=self.symbol,
+                    price=clearing, quantity=fill,
+                    buyer_id=bid.team_id, seller_id=ask.team_id,
+                    aggressor=aggressor,
+                    fee=round(self.fee_rate * notional, 8), timestamp=now,
+                ))
+                self._trade_history.append((now, clearing, fill))
+                self._total_volume += fill
+
+        for oid in [oid for oid, o in self._orders.items() if o.remaining == 0]:
+            del self._orders[oid]
+        return trades
+
+    def snap_to_tick(self, price: float, side: Literal["buy", "sell"]) -> float:
+        """Snap a price onto the tick grid, toward the passive side.
+
+        Buys round down, sells round up: the snapped order is never MORE
+        aggressive than the price the sender asked for. A price below one
+        tick becomes one tick (there is no zero or negative price level).
+        """
+        t = self.tick_size
+        if t <= 0:
+            return price
+        steps = price / t
+        if side == "buy":
+            snapped = math.floor(steps + 1e-9) * t
+        else:
+            snapped = math.ceil(steps - 1e-9) * t
+        return round(max(snapped, t), 10)
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
@@ -262,6 +416,17 @@ class OrderBook:
                 break
 
             resting = self._orders[rest_oid]
+
+            # Self-trade prevention (cancel-resting): never match yourself.
+            # The resting order is cancelled and matching continues to the
+            # next price level, so a bot that crosses its own quote pays by
+            # losing queue position — not by printing a wash trade.
+            if self._stp_key(resting.team_id) == self._stp_key(incoming.team_id):
+                heapq.heappop(opposite)
+                del self._orders[rest_oid]
+                self.stp_cancels.append(resting)
+                continue
+
             fill_qty = min(incoming.remaining, resting.remaining)
             exec_price = resting.price
 

@@ -68,6 +68,16 @@ Watch the logs — every connection, order, and fill is printed.
 - Hint: look for the `TODO Level 3` comment in `orderbook.py`
 - Verify: makers show negative `total_fees_paid` on the leaderboard
 
+**Your fee schedule is your product.** In the hosted game your venue's
+taker/rebate pair is **published to every participant** (dashboard → STATS →
+venue fee schedules, or `GET /api/venues`), and traders route to the cheapest
+venue that fills them. Set yours from the portal (MY TEAM → MY VENUE) or
+`POST /api/venue {token, taker_bps, rebate_bps}`. Bounds keep the game fair:
+taker within teacher-set min/max, and your rebate can never exceed
+`taker − net_min`, so a venue can't rebate itself into bankruptcy. Undercut
+to attract flow, or charge premium and earn more per trade — that trade-off
+IS the exchange game.
+
 ### Level 4 — Circuit breakers
 - Halt trading on a symbol if price moves more than `CIRCUIT_BREAKER_PCT` in one tick
 - Resume automatically after `HALT_DURATION_SEC` seconds

@@ -123,6 +123,42 @@ your P&L is theirs to take.
 
 ---
 
+## Choosing a venue — fee schedules
+
+When the game runs **multiple exchanges** (student teams can license their
+own venue), all venues list the same securities but **charge different
+fees** — that's how they compete for your flow, exactly like real markets.
+Where you route directly changes your P&L:
+
+- **Taker fee** — you pay it when your order *takes* liquidity (crosses the
+  spread and fills immediately).
+- **Maker rebate** — you *earn* it when your resting order is filled by
+  someone else.
+
+Every venue's published schedule is public — check it before you route:
+
+- **Dashboard → STATS tab → "Venue fee schedules"** — the comparison table.
+- **From code**: `GET <arena>/api/venues` (no token needed):
+
+```python
+import json, urllib.request
+
+with urllib.request.urlopen(f"{ARENA_URL}/api/venues") as r:
+    for v in json.load(r)["venues"]:
+        print(f'{v["venue"]:24} port {v["port"]}  '
+              f'taker {v["taker_bps"]} bps / rebate {v["rebate_bps"]} bps')
+```
+
+Point a bot at a specific venue with `EXCHANGE_PORT=<port>` (or give a
+multi-venue bot every venue via `EXCHANGE_URLS=ws://host:p1,ws://host:p2`).
+Back-of-envelope: on a $10,000 fill, each bps is $1 — a venue charging
+12 bps instead of 15 saves $3 per trade, which compounds fast at high
+frequency. Venues can retune their schedule between sessions (within
+teacher-set bounds), so glance at the table each week. Your fills always
+show what you actually paid (`fee`) or earned (`maker_rebate`).
+
+---
+
 ## FAQ
 
 **Do I need AWS credentials or SSH?** No. The server is the teacher's

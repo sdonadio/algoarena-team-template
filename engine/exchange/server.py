@@ -743,8 +743,10 @@ class ExchangeServer:
                         ))
                         return
                 # Borrow locate: total short interest per symbol is capped.
+                # A locate_desk upgrade adds private borrow beyond the pool.
                 cap = config.SHORT_LOCATE_CAP
                 if cap > 0:
+                    cap += config.config_for_team(team_id, "locate_extra")
                     outstanding = sum(
                         max(0, -p.positions.get(msg.symbol, 0))
                         for p in self.portfolios.values())

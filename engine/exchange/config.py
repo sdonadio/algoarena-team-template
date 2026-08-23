@@ -85,6 +85,8 @@ SSR_TRIGGER_PCT = float(os.environ.get("SSR_TRIGGER_PCT", "0.10"))
 # Borrow availability: total short interest per symbol across the whole
 # market is capped at this many shares (a locate, in effect). 0 = unlimited.
 SHORT_LOCATE_CAP = int(os.environ.get("SHORT_LOCATE_CAP", "2000"))
+# Private borrow beyond the market pool — granted by the locate_desk upgrade.
+SHORT_LOCATE_EXTRA = 0
 
 # ── Auctions ──────────────────────────────────────────────────────────────────
 # Opening auction: START enters a pre-open of this many ticks — limit orders
@@ -228,6 +230,12 @@ UPGRADE_EFFECTS: dict[str, dict] = {
         # A financing discount: cheaper carry on borrowed cash.
         "by_upgrade": {"margin_plus": 0.000014},
         "lower_is_better": True,
+    },
+    "locate_extra": {
+        "attr": "SHORT_LOCATE_EXTRA",
+        # A securities-lending relationship: private borrow beyond the pool.
+        "by_upgrade": {"locate_desk": 2000},
+        "lower_is_better": False,
     },
     "taker_fee": {
         "attr": "TAKER_FEE_RATE",

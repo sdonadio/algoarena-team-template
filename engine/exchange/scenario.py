@@ -67,6 +67,19 @@ _FLAG_TO_CONFIG: dict[str, str] = {
     "circuit_breakers": "CIRCUIT_BREAKERS_ENABLED",
 }
 
+# Config globals a scenario file may override via its "config" block —
+# the market-structure mechanics that phase in across the season. A
+# whitelist, because a scenario file is class data, not code: it may tune
+# the market's physics, never arbitrary engine internals.
+ALLOWED_CONFIG_OVERRIDES: dict[str, type] = {
+    "OPENING_AUCTION_TICKS": int,     # pre-open length; 0 = open directly
+    "CLOSING_AUCTION": bool,          # closing cross at session end
+    "CLOSING_AUCTION_TICKS": int,
+    "SSR_TRIGGER_PCT": float,         # short-sale rule trip point; 0 = off
+    "SHORT_LOCATE_CAP": int,          # market-wide borrow pool; 0 = unlimited
+    "LULD_BAND_PCT": float,           # erroneous-order collar; 0 = off
+}
+
 
 @dataclass
 class Scenario:
@@ -85,6 +98,8 @@ class Scenario:
     maintenance_fraction: float | None = None
     scoring_counts: bool = True
     events: list[dict[str, Any]] = field(default_factory=list)
+    # Whitelisted exchange.config overrides (see ALLOWED_CONFIG_OVERRIDES).
+    config_overrides: dict[str, Any] = field(default_factory=dict)
     source: str = ""
 
     # Config values saved by apply(), restored by restore().
@@ -122,6 +137,7 @@ class Scenario:
             "order_quota": self.order_quota,
             "maintenance_fraction": self.maintenance_fraction,
             "scoring_counts": self.scoring_counts,
+            "config": dict(self.config_overrides),
             "events": [
                 {k: v for k, v in ev.items() if k != "direction"}
                 for ev in self.events
@@ -152,6 +168,12 @@ class Scenario:
             if flag in self.flags:
                 self._saved[attr] = getattr(config, attr)
                 setattr(config, attr, bool(self.flags[flag]))
+        for attr, value in self.config_overrides.items():
+            caster = ALLOWED_CONFIG_OVERRIDES.get(attr)
+            if caster is None:
+                continue
+            self._saved[attr] = getattr(config, attr)
+            setattr(config, attr, caster(value))
 
     def restore(self) -> None:
         """Undo apply()."""
@@ -187,6 +209,8 @@ def from_dict(raw: dict[str, Any], source: str = "") -> Scenario:
         order_quota=int(quota) if quota is not None else None,
         scoring_counts=bool(raw.get("scoring_counts", True)),
         events=list(raw.get("events") or []),
+        config_overrides={k: v for k, v in (raw.get("config") or {}).items()
+                          if k in ALLOWED_CONFIG_OVERRIDES},
         source=source,
     )
 

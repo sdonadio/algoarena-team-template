@@ -109,6 +109,7 @@ either way with `SEASON_PERSIST=true` / `SEASON_PERSIST=false`.
 | `position_limit` | int | Per-symbol position cap; overrides `POSITION_LIMIT_SHARES`. Omit to leave config alone. |
 | `order_quota` | int | Order/cancel messages per tick; overrides `ORDER_QUOTA_PER_TICK`. Omit to leave the generous default (which never bites). |
 | `scoring_counts` | bool | `false` on paper weeks — no equity snapshots are taken, so the week cannot affect season rank |
+| `config` | object | Whitelisted market-structure overrides: `OPENING_AUCTION_TICKS`, `CLOSING_AUCTION`, `CLOSING_AUCTION_TICKS`, `SSR_TRIGGER_PCT`, `SHORT_LOCATE_CAP`, `LULD_BAND_PCT`. This is how auctions phase in (opening from week 4, closing from week 6) and how the borrow pool tightens across the season (2000 → 1200 → 1000 → 800 → 600 shares). |
 | `events` | array | Market calendar (§5) |
 
 ### Gate flags
@@ -379,6 +380,29 @@ permanent, so one week understates it).
 Two caveats when reading the output: variance across seeds is large, so use
 several; and the simulated bots cap their own size, so a position-limit
 upgrade may not bind on them even though it would bind on a student bot.
+
+## 5b. The shop as strategy — what buys an edge, when
+
+Purchase windows open in **weeks 4 and 7**. The scenarios are designed so
+each upgrade has weeks where it earns its price — buying the right thing at
+the right window IS part of the game:
+
+| Upgrade | $ | Buy at window 1 (wk 4) if… | Buy at window 2 (wk 7) if… |
+|---|---|---|---|
+| `fee_tier` | 40k | you run a busy desk — pays ~2 bps × your own volume, mostly via the rebate. The one upgrade that's almost always right for high-churn teams. | still the best pure-ROI buy if you skipped it |
+| `locate_desk` | 35k | — (borrow is plentiful, 2000/symbol) | **the window-2 sleeper**: the pool tightens to 1200 → 1000 → 800 → 600 through weeks 7–10. When everyone wants the same short into earnings, you're the only one who can get it. |
+| `risk_shield` | 45k | week 5 raises maintenance margin to 0.4 and liquidations go live — insurance before the storm | cheaper to skip if you survived wk 5–6 comfortably |
+| `calendar_feed` | 35k | every week has scheduled events; earlier warning compounds | same |
+| `order_quota` | 30k | — (no quotas yet) | quotas (8/tick) start in wk 7 — buy only if you see `RATE_LIMITED` rejects |
+| `colocation` | 50k | — (no latency yet) | latency tiers start wk 7; matters most for auction-close racing and NBBO arbitrage in wk 8–10 |
+| `margin_plus` | 40k | brokers carrying heavy inventory into volatile weeks 5–6 | broker desks quoting multiple venues |
+| `position_limit` | 30k | only if you're hitting the cap (check DESK EVENTS) | wk 9–10 futures + equities can crowd the 1000 cap |
+| `analytics_pro` | 25k | TCA on your own fills — cheap, pays in better execution homework | same |
+
+Rule of thumb the scenarios enforce: **window 1 buys production (fee_tier,
+calendar_feed, risk_shield), window 2 buys scarcity (locate_desk, quota,
+colocation)** — because weeks 7–10 are where quotas, latency, and the borrow
+squeeze actually bind.
 
 ## 6. Market calendar
 

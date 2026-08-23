@@ -59,6 +59,7 @@ PRICE_ORDER_QUOTA    =  30_000
 PRICE_COLOCATION     =  50_000
 # Phase 10 additions: a data product, an insurance policy, and a report.
 PRICE_CALENDAR_FEED  =  35_000
+PRICE_LOCATE_DESK    =  35_000
 PRICE_RISK_SHIELD    =  45_000
 PRICE_ANALYTICS_PRO  =  25_000
 
@@ -128,6 +129,20 @@ CATALOG: dict[str, dict] = {
             "optionality, not as an edge."
         ),
         "effect": "outbound latency 200ms → 20ms",
+        "roles": ("trader", "broker"),
+    },
+    "locate_desk": {
+        "key": "locate_desk",
+        "label": "Securities lending desk",
+        "price": PRICE_LOCATE_DESK,
+        "description": (
+            "Your prime broker finds you borrow others can't get: +2,000 "
+            "shares of private locate per symbol, beyond the market-wide "
+            "pool. Worthless while borrow is plentiful — decisive in the "
+            "late-season weeks when the shared pool tightens and everyone "
+            "wants the same short into earnings."
+        ),
+        "effect": "+2,000 shares/symbol of private short locate",
         "roles": ("trader", "broker"),
     },
     # ── Phase 10 additions ────────────────────────────────────────────────

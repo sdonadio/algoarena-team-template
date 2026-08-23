@@ -15,6 +15,10 @@ PORT = int(os.environ.get("EXCHANGE_PORT", "8765"))
 # defaults to open access. Tokens are issued by the registration API and
 # verified against TOKENS_PATH — see shared/auth.py and docs/AWS_DEPLOY.md.
 AUTH_REQUIRED = os.environ.get("AUTH_REQUIRED", "false").lower() in ("true", "1", "yes")
+# Hosted arenas run 24/7 so students can practise between classes — reopen the
+# session automatically on startup (nightly unattended-upgrades bounce the
+# service). Local play keeps the teacher's explicit START.
+SESSION_AUTOOPEN = os.environ.get("SESSION_AUTOOPEN", "false").lower() in ("true", "1", "yes")
 FEE_RATE = float(os.environ.get("ARENA_FEE_RATE", "0.001"))
 
 INITIAL_CASH = 100_000.0          # starting cash for every team

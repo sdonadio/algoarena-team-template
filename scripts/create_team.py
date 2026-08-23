@@ -36,11 +36,20 @@ import urllib.request
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from teacher.registration import (  # noqa: E402
-    DEFAULT_REBATE_BPS, DEFAULT_TAKER_BPS, EXCHANGE_LICENSE, MAX_BROKERS,
-    MAX_TRADERS, MIN_BROKER, MIN_TRADER, TAKER_MAX_BPS, TAKER_MIN_BPS,
-    TEAM_BUDGET, VENUE_NET_MIN_BPS, RegistrationError, load_roster,
-    roster_entry, slugify, validate_plan,
+# Everything the wizard needs is engine-side (exchange/ ships in the student
+# template; teacher/ never does). Only local registration touches teacher code,
+# and imports it lazily inside register_local().
+_ENGINE = ROOT / "engine"                    # student-template layout
+if _ENGINE.is_dir():
+    sys.path.insert(0, str(_ENGINE))
+
+from exchange.config import (  # noqa: E402
+    TAKER_MAX_BPS, TAKER_MIN_BPS, VENUE_NET_MIN_BPS,
+    DEFAULT_REBATE_BPS, DEFAULT_TAKER_BPS,
+)
+from exchange.seats import (  # noqa: E402
+    EXCHANGE_LICENSE, MAX_BROKERS, MAX_TRADERS, MIN_BROKER, MIN_TRADER,
+    TEAM_BUDGET, RegistrationError, roster_entry, slugify, validate_plan,
 )
 
 STUDENTS_DIR = ROOT / "students"
@@ -397,7 +406,11 @@ if __name__ == "__main__":
 
 def register_local(payload: dict) -> None:
     import shared.auth as auth
-    from teacher.registration import ROSTER_PATH, _save_roster
+    try:
+        from teacher.registration import _save_roster, load_roster
+    except ImportError:
+        sys.exit("  ✗ Local registration needs the teacher repo — in a team "
+                 "clone, register against the hosted arena:  make register")
 
     roster = load_roster()
     plan = validate_plan(payload, roster)

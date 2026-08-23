@@ -2,6 +2,19 @@
 
 Welcome to the arena.
 
+## What's in this repo
+
+```
+team/       ← YOUR code (created by make register — 3 small files, your whole job)
+arena/      ← the SDK you derive: Trader, Broker, Exchange (read these, ~100 lines each)
+docs/       ← guides (start with docs/CONNECTING.md)
+engine/     ← the market infrastructure. Read it when curious. Never edit it.
+scripts/    ← the registration wizard and connection test
+tests/      ← offline tests + the no-network simulator
+```
+
+You write `team/`, you import `arena`, you ignore the rest.
+
 ## 0. Create your team's repo (once, one teammate does this)
 
 If you are reading this on the **template repository**, don't clone it —

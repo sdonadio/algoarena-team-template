@@ -8,6 +8,14 @@ capital and positions into every test that builds a server. This redirects
 season persistence to a throwaway directory for the whole test run.
 """
 
+# In the student template the engine lives under engine/ — make it importable.
+import pathlib as _pathlib
+import sys as _sys
+_engine = _pathlib.Path(__file__).resolve().parent.parent / "engine"
+if _engine.is_dir() and str(_engine) not in _sys.path:
+    _sys.path.insert(0, str(_engine))
+del _pathlib, _sys, _engine
+
 import os
 import tempfile
 

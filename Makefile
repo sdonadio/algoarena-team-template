@@ -5,6 +5,8 @@
 export
 
 ARENA_URL ?= https://arena.example.edu
+# The engine lives under engine/ — every target needs it importable.
+export PYTHONPATH := engine:.
 
 install:
 	pip install -r requirements.txt
@@ -26,9 +28,9 @@ exchange:
 	python -m exchange.server
 
 sim:
-	PYTHONPATH=. python tests/sim_session.py
+	python tests/sim_session.py
 
 test:
-	PYTHONPATH=. pytest tests/ -q
+	pytest tests/ -q
 
 .PHONY: install register trader broker exchange sim test

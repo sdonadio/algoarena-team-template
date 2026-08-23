@@ -36,6 +36,17 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Any
 
+# In the student template the engine lives under engine/ — make it importable.
+import pathlib as _pathlib
+import sys as _sys
+_engine = _pathlib.Path(__file__).resolve().parent.parent / "engine"
+_root = _engine.parent
+if str(_root) not in _sys.path:
+    _sys.path.insert(0, str(_root))
+if _engine.is_dir() and str(_engine) not in _sys.path:
+    _sys.path.insert(0, str(_engine))
+del _pathlib, _sys, _engine
+
 from shared.messages import Signal
 from shared.orderbook import OrderBook, Trade
 from exchange.server import Portfolio

@@ -317,3 +317,129 @@ def listing(team: str, team_cfg: dict, purchase_window: bool) -> list[dict]:
             "available": bool(purchase_window) and have < cap,
         })
     return out
+
+# ── Registration economy (the wizard and the server both need this) ───────────
+# This lives engine-side so the student template's wizard works with no
+# teacher/ code present: remote registration validates the plan locally for
+# a friendly walk-through, then the server re-validates authoritatively.
+
+PALETTE = ["#22d3a0", "#38bdf8", "#f59e0b", "#e879f9", "#a855f7", "#f97316",
+           "#34d399", "#fb7185", "#facc15", "#818cf8", "#2dd4bf", "#c084fc"]
+
+
+class RegistrationError(Exception):
+    """Invalid registration request — message is safe to show the student."""
+
+
+def next_color(roster: dict) -> str:
+    used = {cfg.get("color") for cfg in roster.values()}
+    for c in PALETTE:
+        if c not in used:
+            return c
+    return PALETTE[len(roster) % len(PALETTE)]
+
+
+def validate_plan(payload: dict, roster: dict) -> dict:
+    """Validate a registration payload against the economy and the roster.
+
+    payload: { "name": str, "exchange": bool,
+               "broker_capitals": [int, ...], "trader_capitals": [int, ...],
+               "taker_bps": float, "rebate_bps": float }
+
+    taker_bps / rebate_bps are the venue's own fee schedule and only apply
+    when an exchange licence is bought; they default to
+    DEFAULT_TAKER_BPS / DEFAULT_REBATE_BPS.
+
+    Returns the team plan (roster entry fields + bot ids + capital map).
+    Raises RegistrationError with a student-readable message on any problem.
+    """
+    name = str(payload.get("name", "")).strip()
+    if not (2 <= len(name) <= 40):
+        raise RegistrationError("Team name must be 2–40 characters")
+    if name in roster:
+        raise RegistrationError(f"A team named {name!r} already exists")
+    slug = slugify(name)
+    for cfg in roster.values():
+        if any(i.startswith(f"{slug}_") for i in roster_shape.bot_ids_of(cfg)):
+            raise RegistrationError(f"Team id prefix {slug!r} is already taken")
+
+    want_exchange = bool(payload.get("exchange"))
+    broker_caps = [int(c) for c in payload.get("broker_capitals", [])]
+    trader_caps = [int(c) for c in payload.get("trader_capitals", [])]
+
+    if len(broker_caps) > MAX_BROKERS:
+        raise RegistrationError(f"At most {MAX_BROKERS} broker desks")
+    if len(trader_caps) > MAX_TRADERS:
+        raise RegistrationError(f"At most {MAX_TRADERS} trader seats")
+    if not want_exchange and not broker_caps and not trader_caps:
+        raise RegistrationError("Buy at least one seat")
+    if any(c < MIN_BROKER for c in broker_caps):
+        raise RegistrationError(f"Broker desks need at least ${MIN_BROKER:,}")
+    if any(c < MIN_TRADER for c in trader_caps):
+        raise RegistrationError(f"Trader seats need at least ${MIN_TRADER:,}")
+
+    spent = (EXCHANGE_LICENSE if want_exchange else 0) + sum(broker_caps) + sum(trader_caps)
+    if spent > TEAM_BUDGET:
+        raise RegistrationError(
+            f"Allocation ${spent:,} exceeds the ${TEAM_BUDGET:,} budget")
+
+    fees = None
+    if want_exchange:
+        taker_bps = payload.get("taker_bps", config.DEFAULT_TAKER_BPS)
+        rebate_bps = payload.get("rebate_bps", config.DEFAULT_REBATE_BPS)
+        if taker_bps is None:
+            taker_bps = config.DEFAULT_TAKER_BPS
+        if rebate_bps is None:
+            rebate_bps = config.DEFAULT_REBATE_BPS
+        try:
+            taker_bps, rebate_bps = config.validate_fee_bps(taker_bps, rebate_bps)
+        except ValueError as exc:
+            raise RegistrationError(str(exc)) from None
+        fees = {"taker": round(taker_bps / 10_000.0, 8),
+                "rebate": round(rebate_bps / 10_000.0, 8)}
+
+    broker_ids = ([f"{slug}_broker"] if len(broker_caps) == 1
+                  else [f"{slug}_broker_{i+1}" for i in range(len(broker_caps))])
+    trader_ids = [f"{slug}_trader_{i+1}" for i in range(len(trader_caps))]
+
+    return {
+        "name": name,
+        "slug": slug,
+        "color": next_color(roster),
+        # Reserve the primary arena's own port: it is bound from an env var,
+        # not a roster entry, so without this the first licensed venue would
+        # be assigned the port the main exchange is already listening on.
+        "exchange_port": (next_port(roster, reserved=(config.PORT,))
+                          if want_exchange else None),
+        "fees": fees,
+        "broker_ids": broker_ids,
+        "trader_ids": trader_ids,
+        "capital": {**dict(zip(broker_ids, broker_caps)),
+                    **dict(zip(trader_ids, trader_caps))},
+        "unspent": TEAM_BUDGET - spent,
+    }
+
+
+def roster_entry(plan: dict, module_prefix: str | None = None) -> dict:
+    """Build the teams.json entry for a validated plan."""
+    entry: dict = {"color": plan["color"]}
+    if plan["exchange_port"]:
+        entry["exchange_port"] = plan["exchange_port"]
+        entry["exchange"] = f"{plan['slug']}_exchange"
+        if plan.get("fees"):
+            entry["fees"] = plan["fees"]
+    if plan["broker_ids"]:
+        # BOTH fields, always: `brokers` is the record of every desk the team
+        # bought, `broker` is its first and exists so a reader that predates
+        # the list still resolves the main desk. Writing only the scalar lost
+        # the second desk of any two-desk team — it went nowhere but the
+        # capital map, where nothing looks for a participant.
+        entry["brokers"] = list(plan["broker_ids"])
+        entry["broker"] = plan["broker_ids"][0]
+        if module_prefix:
+            entry["broker_module"] = f"{module_prefix}.broker"
+    entry["traders"] = plan["trader_ids"]
+    if plan["trader_ids"] and module_prefix:
+        entry["trader_module"] = f"{module_prefix}.trader"
+    entry["capital"] = plan["capital"]
+    return entry

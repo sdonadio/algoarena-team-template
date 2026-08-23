@@ -37,6 +37,14 @@ The engine underneath (shared/, exchange/, broker/, trader/) is readable —
 studying it is encouraged — but you never need to edit it.
 """
 
+# In the student template the engine lives under engine/ — make it importable.
+import pathlib as _pathlib
+import sys as _sys
+_engine = _pathlib.Path(__file__).resolve().parent.parent / "engine"
+if _engine.is_dir() and str(_engine) not in _sys.path:
+    _sys.path.insert(0, str(_engine))
+del _pathlib, _sys, _engine
+
 from shared.messages import Signal
 
 from arena.broker import Broker

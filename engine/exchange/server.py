@@ -2502,6 +2502,10 @@ async def main() -> None:
     async with websockets.serve(server.handle_client, config.HOST, config.PORT):
         _print_startup(server)
 
+        if config.SESSION_AUTOOPEN:
+            await server.open_session()
+            logger.info("SESSION_AUTOOPEN — session opened at startup")
+
         # TODO Level 6: Compute and broadcast VWAP; implement analytics endpoint
 
         try:

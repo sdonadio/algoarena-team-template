@@ -37,7 +37,10 @@ import urllib.error
 import urllib.request
 import uuid
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+_ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_ROOT))
+if (_ROOT / "engine").is_dir():        # student-template layout
+    sys.path.insert(0, str(_ROOT / "engine"))
 
 import websockets
 

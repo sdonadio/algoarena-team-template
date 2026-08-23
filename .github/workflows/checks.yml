@@ -8,8 +8,8 @@ jobs:
       - uses: actions/setup-python@v5
         with: {python-version: "3.11"}
       - run: pip install -r requirements.txt
-      - run: PYTHONPATH=. pytest tests/ -q
+      - run: PYTHONPATH=engine:. pytest tests/ -q
       - name: bots import cleanly
         run: |
-          python -c "import arena, trader.trader, broker.broker, exchange.server"
-          if [ -d team ]; then python -c "import team.config"; fi
+          PYTHONPATH=engine:. python -c "import arena, trader.trader, broker.broker, exchange.server"
+          if [ -d team ]; then PYTHONPATH=engine:. python -c "import team.config"; fi

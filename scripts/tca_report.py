@@ -63,6 +63,8 @@ from dataclasses import dataclass, field
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+if (ROOT / "engine").is_dir():     # student-template layout
+    sys.path.insert(0, str(ROOT / "engine"))
 
 from pydantic import ValidationError                              # noqa: E402
 from rich.console import Console                                  # noqa: E402

@@ -79,7 +79,7 @@ ignored with a warning.)
 - Compute a rolling standard deviation of `price_history` (window = `VOL_WINDOW` ticks)
 - Set `spread = BASE_SPREAD + VOL_MULTIPLIER × vol_estimate`
 - Wide spread when volatile; narrow spread when quiet — maximises risk-adjusted income
-- Hint: look for `TODO Level 3` in `compute_spread()`
+- Hint: your SDK hook is `MyBroker.spread(symbol, price, history)` in `team/broker.py`; the engine's `compute_spread()` shows the default
 - Verify: fire the "earnings" shock, confirm spread widens automatically
 
 ### Level 4 — Inventory management and quote skew

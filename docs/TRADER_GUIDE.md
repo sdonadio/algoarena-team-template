@@ -52,9 +52,10 @@ It flattens all positions automatically when `SESSION_CLOSED` arrives.
 
 ### Level 1 — Connect and place orders *(start here)*
 - Connect, receive `BookSnapshot` messages, place a single test order
-- Your `generate_signal()` returns a random 1-share order 10% of the time
+- Your surface is `MyTrader.on_tick(market, portfolio)` in `team/trader.py`
+  (the `arena` SDK handles all plumbing) — return a `Signal` to trade,
+  `None` to sit out; try one manual fill via MY TEAM → ORDER TICKET first
 - Goal: confirm your `TEAM_ID` appears on the leaderboard
-- Key file: look for `# TODO Level 1` in `strategy.generate_signal()`
 
 ### Level 2 — Track portfolio in real time
 - Parse `PortfolioUpdate` messages and update `Portfolio`
@@ -62,7 +63,8 @@ It flattens all positions automatically when `SESSION_CLOSED` arrives.
 - Goal: your displayed net worth matches the leaderboard exactly
 
 ### Level 3 — Implement a real signal
-- Choose one of the five commented-out strategy templates in `generate_signal()`:
+- Write it in `on_tick()`; worked sketches of every option live in
+  `engine/trader/trader.py` (`Strategy.generate_signal`, OPTIONS A–G):
   - **Option A**: Moving-average crossover (momentum)
   - **Option B**: Z-score mean reversion
   - **Option C**: Order book imbalance

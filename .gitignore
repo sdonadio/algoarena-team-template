@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+.DS_Store
+.idea/
+venv/
+.venv/
+sessions/
+
+# Secrets — your team token. NEVER commit this.
+.env

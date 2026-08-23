@@ -1,0 +1,24 @@
+# AlgoArena — pinned dependencies
+# Install with: pip install -r requirements.txt
+# Python 3.11+ required (uses match statements and 3.11 asyncio features).
+
+# ── Core networking ───────────────────────────────────────────────────────────
+websockets>=12.0,<16.0          # WebSocket server and clients
+
+# ── Schema validation ─────────────────────────────────────────────────────────
+pydantic>=2.0,<3.0              # strict message schemas with Literal discriminators
+
+# ── Market data (brokers only) ────────────────────────────────────────────────
+alpaca-py>=0.20.0               # Alpaca paper-trading WebSocket streams
+yfinance>=0.2                   # Yahoo Finance price feed (free, works on weekends)
+
+# ── Terminal UI ───────────────────────────────────────────────────────────────
+rich>=13.0,<16.0                # live leaderboard dashboard + shock tool console
+
+# ── Strategy / analytics ──────────────────────────────────────────────────────
+numpy>=1.26,<3.0                # vectorised signal computation
+pandas>=2.0,<3.0                # OHLCV data wrangling in advanced strategies
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest>=7.0,<11.0               # test runner
+pytest-asyncio>=0.23            # async test support (needed for WebSocket tests)

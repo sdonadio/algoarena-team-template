@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import pathlib
 import signal
 import socket
 import sys
@@ -74,7 +75,8 @@ logger = logging.getLogger(__name__)
 def _new_part_stats() -> dict:
     """Empty cumulative activity record for one participant."""
     return {"trade_count": 0, "volume": 0.0, "buy_count": 0,
-            "sell_count": 0, "maker_count": 0}
+            "sell_count": 0, "maker_count": 0,
+            "shares_bought": 0, "shares_sold": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -108,26 +110,57 @@ class Portfolio:
 
     def apply_buy(self, symbol: str, price: float, qty: int, fee: float,
                   rebate: float = 0.0) -> None:
-        """Record a buy fill: debit cash, update position and average cost."""
-        old_qty = max(0, self.positions.get(symbol, 0))
-        old_cost = self.avg_cost.get(symbol, 0.0) * old_qty
-        new_qty = old_qty + qty
+        """Record a buy fill: debit cash, update position and average cost.
 
+        Signed average-cost accounting: buying while SHORT is a cover and
+        realises (avg_short − price) on the covered part — the old code
+        skipped that, so a short round trip gained cash but booked zero
+        realized P&L (attribution bug; net worth was always right).
+        """
         self.cash -= price * qty + fee - rebate
         self.total_fees_paid += fee
         self.total_rebates_earned += rebate
-        self.positions[symbol] = self.positions.get(symbol, 0) + qty
-        self.avg_cost[symbol] = (old_cost + price * qty) / new_qty if new_qty else price
+        self._book_signed_fill(symbol, price, +qty)
 
     def apply_sell(self, symbol: str, price: float, qty: int, fee: float,
                    rebate: float = 0.0) -> None:
-        """Record a sell fill: credit cash, realise P&L, update position."""
-        avg = self.avg_cost.get(symbol, price)
+        """Record a sell fill: credit cash, realise P&L, update position.
+
+        Selling while long realises (price − avg) on the closed part;
+        selling flat/short OPENS a short at a tracked entry price, so an
+        open short marks to market like any position.
+        """
         self.cash += price * qty - fee + rebate
         self.total_fees_paid += fee
         self.total_rebates_earned += rebate
-        self.realized_pnl += (price - avg) * qty
-        self.positions[symbol] = self.positions.get(symbol, 0) - qty
+        self._book_signed_fill(symbol, price, -qty)
+
+    def _book_signed_fill(self, symbol: str, price: float, signed: int) -> None:
+        """Position/avg-cost/realized bookkeeping for a fill of `signed` shares.
+
+        One rule for longs and shorts alike: same direction extends the
+        position at a volume-weighted entry; opposite direction realises
+        (price − avg) × closed × sign(old) on the part that closes, and a
+        flip re-opens the remainder at the fill price.
+        """
+        old = self.positions.get(symbol, 0)
+        entry = self.avg_cost.get(symbol, price)
+
+        if old == 0 or (old > 0) == (signed > 0):
+            total = abs(old) + abs(signed)
+            self.avg_cost[symbol] = (
+                (abs(old) * entry + abs(signed) * price) / total
+                if total else price)
+        else:
+            closed = min(abs(old), abs(signed))
+            direction = 1 if old > 0 else -1
+            self.realized_pnl += (price - entry) * closed * direction
+            if abs(signed) > abs(old):
+                self.avg_cost[symbol] = price      # flipped through zero
+
+        self.positions[symbol] = old + signed
+        if self.positions[symbol] == 0:
+            self.avg_cost.pop(symbol, None)
 
     # -- Futures (cash-settled; see exchange/config.FUTURES) ----------
 
@@ -303,6 +336,12 @@ class ExchangeServer:
         self._session_granted: bool = False
         self._pending_close_persist: bool = True
         self._last_reject_relay: dict[str, float] = {}
+        # Start-of-day snapshot (taken at open, after the grant) and the
+        # ledger of shares granted MID-session (late joiners, ticket bots).
+        # Together they close the reconciliation identities at EOD.
+        self.sod: dict[str, dict] = {}
+        self.sod_market_shares: int = 0
+        self.midsession_grants: dict[str, int] = {}
         self.tick: int = 0
         # Recent fills, bounded so a multi-hour session cannot exhaust memory.
         # Cumulative counts live in trade_count / part_stats (never trimmed).
@@ -463,6 +502,8 @@ class ExchangeServer:
                                 portfolio.positions.get(sym, 0) + n)
                             if sym not in portfolio.avg_cost:
                                 portfolio.avg_cost[sym] = self.ref_prices.get(sym, 0.0)
+                            self.midsession_grants[sym] = (
+                                self.midsession_grants.get(sym, 0) + n)
                         await self._send(
                             websocket, portfolio.to_message(self.ref_prices))
                 await self._send(websocket, SessionEvent(
@@ -1179,6 +1220,8 @@ class ExchangeServer:
                     if not config.is_future(sym):
                         portfolio.positions[sym] = n
                         portfolio.avg_cost[sym] = self.ref_prices.get(sym, 0.0)
+                        self.midsession_grants[sym] = (
+                            self.midsession_grants.get(sym, 0) + n)
 
         capture = self._CaptureWS()
         await self._handle_place_order(capture, PlaceOrder(
@@ -1449,10 +1492,12 @@ class ExchangeServer:
         b["trade_count"] += 1
         b["volume"] += notional
         b["buy_count"] += 1
+        b["shares_bought"] += trade.quantity
         s = self.part_stats[trade.seller_id]
         s["trade_count"] += 1
         s["volume"] += notional
         s["sell_count"] += 1
+        s["shares_sold"] += trade.quantity
         self.part_stats[maker_id]["maker_count"] += 1
 
     # ------------------------------------------------------------------
@@ -2189,6 +2234,7 @@ class ExchangeServer:
         # measured from (taken after the share grant, so the free inventory
         # is not counted as profit).
         self.snapshot_equity(force=True)
+        self._capture_sod()
 
         # Publish the week's calendar. Timing is announced up front; direction
         # is resolved only when each event fires.
@@ -2205,6 +2251,148 @@ class ExchangeServer:
                   "week": self.scenario.week,
                   "scenario": self.scenario.to_dict()},
         ))
+
+    def _capture_sod(self) -> None:
+        """Freeze the start-of-day baseline the EOD reconciliation diffs against.
+
+        Taken at the completed open — AFTER the share grant — so the day's
+        report attributes only what the day itself did.
+        """
+        self.midsession_grants = {}
+        self.sod = {}
+        for bot, pf in self.portfolios.items():
+            if pf.role == "observer":
+                continue
+            st = self.part_stats[bot]
+            self.sod[bot] = {
+                "positions": dict(pf.positions),
+                "cash": pf.cash,
+                "net_worth": pf.net_worth(self.ref_prices),
+                "realized": pf.realized_pnl,
+                "fees": pf.total_fees_paid,
+                "rebates": pf.total_rebates_earned,
+                "carry": pf.total_carry_paid,
+                "shares_bought": st["shares_bought"],
+                "shares_sold": st["shares_sold"],
+                "volume": st["volume"],
+                "trade_count": st["trade_count"],
+            }
+        self.sod_market_shares = sum(
+            b._total_volume for b in self.books.values())
+
+    async def _write_eod_report(self) -> None:
+        """The end-of-day reconciliation: positions, flows, P&L, identities.
+
+        Three identities must hold, or the engine minted/destroyed something:
+
+          1. Σ shares bought = Σ shares sold = market volume — every share
+             bought was sold by someone, and the venue counted each print once.
+          2. Σ EOD positions − Σ SOD positions = mid-session grants, per
+             symbol — trades only MOVE inventory; only grants create it.
+          3. Per team: ΔNW = Δrealized + Δunrealized − Δfees + Δrebates
+             − Δcarry + other cash flows (dividends/interest/variation) —
+             reported per team so an attribution gap is visible.
+        """
+        rows = []
+        tot_bought = tot_sold = 0
+        sod_pos_by_sym: dict[str, int] = {}
+        eod_pos_by_sym: dict[str, int] = {}
+        for bot, pf in self.portfolios.items():
+            if pf.role == "observer":
+                continue
+            base = self.sod.get(bot) or {
+                "positions": {}, "cash": pf.starting_cash, "net_worth":
+                pf.starting_cash, "realized": 0.0, "fees": 0.0,
+                "rebates": 0.0, "carry": 0.0, "shares_bought": 0,
+                "shares_sold": 0, "volume": 0.0, "trade_count": 0}
+            st = self.part_stats[bot]
+            bought = st["shares_bought"] - base["shares_bought"]
+            sold = st["shares_sold"] - base["shares_sold"]
+            tot_bought += bought
+            tot_sold += sold
+            for sym, q in base["positions"].items():
+                sod_pos_by_sym[sym] = sod_pos_by_sym.get(sym, 0) + q
+            for sym, q in pf.positions.items():
+                eod_pos_by_sym[sym] = eod_pos_by_sym.get(sym, 0) + q
+            eod_nw = pf.net_worth(self.ref_prices)
+            rows.append({
+                "bot": bot, "role": pf.role,
+                "sod_positions": {k: v for k, v in
+                                  base["positions"].items() if v},
+                "eod_positions": {k: v for k, v in pf.positions.items() if v},
+                "shares_bought": bought, "shares_sold": sold,
+                "share_volume": bought + sold,
+                "notional_volume": round(st["volume"] - base["volume"], 2),
+                "trades": st["trade_count"] - base["trade_count"],
+                "sod_net_worth": round(base["net_worth"], 2),
+                "eod_net_worth": round(eod_nw, 2),
+                "day_pnl": round(eod_nw - base["net_worth"], 2),
+                "realized_delta": round(pf.realized_pnl - base["realized"], 2),
+                "eod_unrealized": round(pf.unrealized_pnl(self.ref_prices), 2),
+                "fees_delta": round(pf.total_fees_paid - base["fees"], 2),
+                "rebates_delta": round(
+                    pf.total_rebates_earned - base["rebates"], 2),
+                "carry_delta": round(pf.total_carry_paid - base["carry"], 2),
+            })
+        rows.sort(key=lambda r: -r["day_pnl"])
+
+        market_shares = sum(
+            b._total_volume for b in self.books.values()) - self.sod_market_shares
+
+        # Identity 1: buys = sells = the venue's own count of shares printed.
+        volume_ok = (tot_bought == tot_sold == market_shares)
+        # Identity 2: inventory is conserved up to mid-session grants.
+        symbols = set(sod_pos_by_sym) | set(eod_pos_by_sym)
+        pos_breaks = {}
+        for sym in symbols:
+            drift = (eod_pos_by_sym.get(sym, 0) - sod_pos_by_sym.get(sym, 0)
+                     - self.midsession_grants.get(sym, 0))
+            if drift:
+                pos_breaks[sym] = drift
+        checks = {
+            "volume_identity": {
+                "ok": volume_ok,
+                "sum_shares_bought": tot_bought,
+                "sum_shares_sold": tot_sold,
+                "exchange_market_volume": market_shares,
+            },
+            "position_conservation": {
+                "ok": not pos_breaks,
+                "midsession_grants": dict(self.midsession_grants),
+                "breaks": pos_breaks,     # symbol → unexplained share drift
+            },
+        }
+        report = {
+            "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "week": self.scenario.week,
+            "label": self.scenario.label,
+            "tick": self.tick,
+            "trades": self.trade_count,
+            "checks": checks,
+            "teams": rows,
+        }
+
+        out_dir = pathlib.Path("data") / "reports"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        (out_dir / f"eod_{stamp}.json").write_text(
+            json.dumps(report, indent=2) + "\n")
+
+        status = ("PASS" if volume_ok and not pos_breaks else "FAIL")
+        logger.info(
+            "EOD RECON %s  bought=%d sold=%d market=%d  pos_breaks=%s  → %s",
+            status, tot_bought, tot_sold, market_shares,
+            pos_breaks or "none", out_dir / f"eod_{stamp}.json")
+        for teacher in self.teacher_clients:
+            tws = self.clients.get(teacher)
+            if tws:
+                await self._send(tws, SessionEvent(
+                    event="EOD_REPORT",
+                    message=(f"EOD reconciliation {status}: "
+                             f"{tot_bought} bought = {tot_sold} sold = "
+                             f"{market_shares} printed"),
+                    data={"checks": checks, "teams": rows[:20]},
+                ))
 
     async def close_session(self, persist: bool = True) -> None:
         """Close the session and broadcast the final leaderboard.
@@ -2236,6 +2424,11 @@ class ExchangeServer:
             return
 
         was_open = self.session_open
+        if was_open:
+            try:
+                await self._write_eod_report()
+            except Exception:
+                logger.exception("EOD report failed — session close continues")
         self.session_open = False
         self.auction_phase = None
         self.auction_ticks_left = 0

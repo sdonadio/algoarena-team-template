@@ -293,8 +293,8 @@ def scenario_shocks(scenario: Scenario, max_tick: int) -> list:
     out = []
     for ev in scenario.events:
         kind = str(ev.get("kind", ""))
-        if kind == "dividend":
-            continue
+        if kind in ("dividend", "ipo"):
+            continue      # cash / listing events, not price shocks
         tick = int(ev.get("tick", 0))
         if tick <= 0:
             continue

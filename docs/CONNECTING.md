@@ -170,6 +170,26 @@ faithful; recalibrate the magnitudes before quoting them in a real job.
 
 ---
 
+## IPOs
+
+Some weeks a new stock lists. The deal is announced at the open (range,
+shares, book window); subscribe from your bot:
+
+```python
+class MyTrader(Trader):
+    def on_ipo(self, symbol, lo, hi, shares, data):
+        return 200            # bid 200 shares at the top of the range
+        # or: return (200, (lo + hi) / 2)   # bid tighter, risk missing it
+```
+
+or by hand from **MY TEAM → IPO DESK**. One indication per bot —
+resubmitting replaces. Cash is debited only if you're allocated at
+pricing; oversubscribed books allocate pro-rata. The listing starts at the
+offer price and finds its level in the open market — it may pop, it may
+break. `IPO_*` events carry the state; watch the tape at the listing tick.
+
+---
+
 ## Choosing a venue — fee schedules
 
 When the game runs **multiple exchanges** (student teams can license their

@@ -404,6 +404,39 @@ calendar_feed, risk_shield), window 2 buys scarcity (locate_desk, quota,
 colocation)** — because weeks 7–10 are where quotas, latency, and the borrow
 squeeze actually bind.
 
+## 5c. IPOs — the primary market
+
+Weeks 3 and 8 bring a new listing (`"kind": "ipo"` in the scenario file):
+
+```json
+{"kind": "ipo", "symbol": "ORCA", "name": "Orca Analytics",
+ "offer_range": [24.0, 28.0], "shares": 4000,
+ "window": [150, 450], "tick": 550}
+```
+
+Lifecycle, broadcast as `IPO_ANNOUNCE → IPO_OPEN → IPO_PRICED → IPO_LISTED`:
+
+1. **Announce** (session open): range, size, and the book window.
+2. **Bookbuild**: bots submit one indication each — `(quantity,
+   max_price)` — via the SDK hook `Trader.on_ipo()` (return `qty` for the
+   top of the range or `(qty, max_price)`), or by hand from MY TEAM's IPO
+   DESK. Resubmitting replaces.
+3. **Pricing**: the offer prices at the highest level that fills the book
+   (undersubscribed → bottom of the range). Oversubscribed → pro-rata
+   allocation. Cash is debited only for allocated shares; proceeds go to
+   the issuer (a real cash sink, ledgered by the EOD reconciliation).
+4. **Listing**: the stock starts trading AT the offer price while its
+   hidden true value sits at `offer × exp(N(+12%, 18%))` — drawn
+   deterministically per symbol, so every venue agrees. The tick-capped
+   engine walks the price toward the truth over the next minutes: the
+   average deal pops, roughly a quarter break issue, and the first hour of
+   trading is the discovery.
+
+What it teaches: underpricing ("leaving money on the table"), the winner's
+curse (a hot book prices at the top — exactly when the pop is smallest),
+oversubscription games (bid more than you want, get cut back pro-rata —
+and pay for it when the book is cold), and listing-day momentum.
+
 ## 6. Market calendar
 
 Calendar events come from the scenario `events` array. See

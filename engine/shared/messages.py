@@ -21,6 +21,7 @@ __all__ = [
     "UpgradeRequest",
     "SeatRequest",
     "ManualOrder",
+    "IPOSubscribe",
     # Exchange → Client
     "OrderAck",
     "TradeExecution",
@@ -128,6 +129,24 @@ class ManualOrder(BaseModel):
     request_id: str = ""   # echoed back on the result, for the portal
 
 
+class IPOSubscribe(BaseModel):
+    """An indication of interest in an open IPO book.
+
+    Direct from a bot (team_id = the bot itself) or forwarded by the
+    portal's teacher relay (team names the roster team; the exchange
+    re-validates the bot belongs to it). One indication per bot —
+    resubmitting REPLACES, like a real book.
+    """
+
+    type: Literal["ipo_subscribe"] = "ipo_subscribe"
+    team_id: str                     # the subscribing BOT
+    symbol: str
+    quantity: int
+    max_price: float = 0.0           # 0 → top of the range
+    team: str = ""                   # roster team (relay path only)
+    request_id: str = ""             # echoed on the result, for the portal
+
+
 class SeatRequest(BaseModel):
     """Hire a new bot mid-season: a trader seat, a broker desk, or a venue.
 
@@ -190,6 +209,9 @@ class BookSnapshot(BaseModel):
     # is what a market maker should quote AROUND — quoting around the book mid
     # means quoting around your own quotes. Defaults to 0.0 for older venues.
     ref_price: float = 0.0
+    # "equity" | "future" | … — lets a market maker discover NEW listings
+    # (IPOs) without hardcoding a symbol list, while skipping futures.
+    asset_type: str = "equity"
 
 
 class PortfolioUpdate(BaseModel):
@@ -268,7 +290,7 @@ class SecurityDef(BaseModel):
 
 AnyClientMessage = Annotated[
     Union[Handshake, PlaceOrder, CancelOrder, TeacherCommand, UpgradeRequest,
-          SeatRequest, ManualOrder],
+          SeatRequest, ManualOrder, IPOSubscribe],
     Field(discriminator="type"),
 ]
 
@@ -294,6 +316,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "upgrade_request": UpgradeRequest,
     "seat_request": SeatRequest,
     "manual_order": ManualOrder,
+    "ipo_subscribe": IPOSubscribe,
     "order_ack": OrderAck,
     "trade_execution": TradeExecution,
     "book_snapshot": BookSnapshot,

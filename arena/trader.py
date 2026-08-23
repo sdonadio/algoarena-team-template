@@ -12,8 +12,10 @@ import logging
 from abc import ABC, abstractmethod
 
 import trader.config as _config
-from shared.messages import Signal, TradeExecution
+from shared.messages import IPOSubscribe, Signal, TradeExecution
 from trader.trader import MarketData, Portfolio, Strategy, TraderBot
+
+logger = logging.getLogger(__name__)
 
 
 class Trader(ABC):
@@ -56,12 +58,23 @@ class Trader(ABC):
         """Called when one of YOUR orders executes. Default: nothing."""
 
     def on_event(self, event: str, message: str, data: dict) -> None:
-        """Market news: SHOCK, CALENDAR, CALENDAR_EVENT, DIVIDEND, …
+        """Market news: SHOCK, CALENDAR, CALENDAR_EVENT, DIVIDEND, IPO_*, …
 
         `data` carries the specifics (e.g. CALENDAR → data["events"] lists
         upcoming events with tick and magnitude but never direction).
         Default: nothing — but the best Level 5+ traders live here.
         """
+
+    def on_ipo(self, symbol: str, lo: float, hi: float, shares: int,
+               data: dict) -> int | tuple[int, float] | None:
+        """An IPO book just opened. Return your indication, or None to pass.
+
+        Return a quantity (bids the TOP of the range — the sure allocation)
+        or (quantity, max_price) to bid tighter and risk missing the deal.
+        Cash is only debited if you are allocated at pricing. The listing
+        may pop above the offer — or break below it. Choose.
+        """
+        return None
 
     # ── Entry point (don't override) ────────────────────────────────────
 
@@ -98,5 +111,21 @@ class _AdaptedTraderBot(TraderBot):
 
     async def _on_session_event(self, msg) -> None:
         await super()._on_session_event(msg)
+        if msg.event == "IPO_OPEN":
+            d = msg.data or {}
+            lo, hi = (d.get("offer_range") or [0, 0])[:2]
+            try:
+                wish = self._owner.on_ipo(d.get("symbol", ""), float(lo),
+                                          float(hi), int(d.get("shares", 0)),
+                                          d)
+            except Exception:
+                logger.exception("on_ipo raised — passing on the deal")
+                wish = None
+            if wish:
+                qty, px = (wish if isinstance(wish, tuple) else (wish, hi))
+                if int(qty) > 0:
+                    await self._send(IPOSubscribe(
+                        team_id=_config.TEAM_ID, symbol=d.get("symbol", ""),
+                        quantity=int(qty), max_price=float(px)))
         if msg.event not in ("SESSION_OPEN", "SESSION_CLOSED"):
             self._owner.on_event(msg.event, msg.message, msg.data or {})

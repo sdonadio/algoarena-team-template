@@ -58,6 +58,14 @@ Already working in your starters. Your job is to run it and understand it.
 | 🏛 | **Rate limiting**: order-to-trade ratio enforcement + per-team order quotas | `engine/shared/orderbook.py` (TODO Level 5), `engine/exchange/config.py` `MAX_ORDERS_PER_MIN_PER_TEAM` |
 | 🏛 | **Detect the whale**: the institutional VWAP slicer fires on a fixed clock — find it in your venue's flow analytics | `team/exchange.py → on_trade()` |
 
+## The IPO weeks (3 and 8)
+
+| Role | Task | Where |
+|---|---|---|
+| 🤖 | **Play the primary market**: implement `on_ipo` — size your indication against the range, the book heat, and your cash | `team/trader.py → on_ipo()` |
+| 🤖 | **Trade the listing**: the price starts at the offer and walks to its hidden value — momentum vs fade on listing day | `on_event("IPO_LISTED")` + `on_tick` |
+| 🏦 | **Quote the new name**: nobody has inventory except allocants — spreads are wide and the first market maker in earns them | `team/broker.py` |
+
 ## Level 6 — Full markets (Weeks 8–9)
 
 | Role | Task | Where |

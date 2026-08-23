@@ -188,6 +188,8 @@ class BrokerBot:
 
     def __init__(self, exchange_url: str | None = None) -> None:
         self.state = BrokerState()
+        # The quoting universe: seeded from config, grown by new listings.
+        self._quote_symbols: list[str] = list(config.EQUITY_SYMBOLS)
         self.exchange_url = exchange_url or config.EXCHANGE_URL
         self._ws: Any = None
         self._session_open = False
@@ -237,6 +239,17 @@ class BrokerBot:
                     self.state.exchange_prices[msg.symbol] = ref
                     self.state.price_history.setdefault(
                         msg.symbol, deque(maxlen=100)).append(ref)
+                # New listings (IPOs) join the quoting universe the moment
+                # the venue snapshots them — a market maker's job is to make
+                # the first market in a new name. Futures are not equities.
+                if (getattr(msg, "asset_type", "equity") == "equity"
+                        and msg.symbol not in self._quote_symbols):
+                    self._quote_symbols.append(msg.symbol)
+                    self.state.resting_orders.setdefault(msg.symbol, {
+                        "buy_id": None, "buy_qty": 0,
+                        "sell_id": None, "sell_qty": 0,
+                        "buy_ids": [], "sell_ids": [],
+                    })
             elif isinstance(msg, OrderAck):
                 self._on_order_ack(msg)
             elif isinstance(msg, TradeExecution):
@@ -505,7 +518,7 @@ class BrokerBot:
 
     async def cancel_all_quotes(self) -> None:
         """Cancel all resting orders across all symbols."""
-        for sym in config.EQUITY_SYMBOLS:
+        for sym in list(self._quote_symbols):
             try:
                 await self.cancel_quotes(sym)
             except Exception:
@@ -536,7 +549,7 @@ class BrokerBot:
             await asyncio.sleep(config.REQUOTE_INTERVAL_SEC)
             if not self._session_open:
                 continue
-            for sym in config.EQUITY_SYMBOLS:
+            for sym in list(self._quote_symbols):
                 try:
                     await self.quote_symbol(sym)
                 except Exception:

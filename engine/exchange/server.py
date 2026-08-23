@@ -34,6 +34,7 @@ import websockets.exceptions
 from pydantic import ValidationError
 
 import exchange.config as config
+import exchange.ipo as ipo_mod
 import exchange.persistence as persistence
 import exchange.scenario as scenario_mod
 import exchange.scoring as scoring
@@ -54,6 +55,7 @@ from shared.messages import (
     OrderAck,
     PlaceOrder,
     PortfolioUpdate,
+    IPOSubscribe,
     ManualOrder,
     SeatRequest,
     SessionEvent,
@@ -321,6 +323,11 @@ class ExchangeServer:
         self.circuit_breaker = CircuitBreaker(list(self.books.keys()))
 
         self.session_open: bool = False
+        # The tick at which the current session opened. Scenario event ticks
+        # (calendar, IPOs) are RELATIVE to this: a persisted season restores
+        # tick 6000+, and absolute comparisons made every scheduled event
+        # fire instantly at the open.
+        self.session_open_tick: int = 0
         # Venue-held stop orders: symbol → order_id → entry. Armed, not in
         # the book; they fire on trade prints or the venue mark crossing
         # stop_price, then re-enter as market/limit orders. Day orders —
@@ -348,6 +355,10 @@ class ExchangeServer:
         # Market-on-close orders: held like stops, injected into the
         # closing auction book when the pre-close window opens.
         self.moc_orders: dict[str, dict[str, dict]] = {}
+        # Live IPO offerings this session: symbol → IPOOffering.
+        self.ipos: dict[str, ipo_mod.IPOOffering] = {}
+        self.ipo_issued: dict[str, int] = {}   # shares created by listings
+        self.ipo_proceeds: float = 0.0         # cash paid to the issuer
         self.dividends_net: float = 0.0      # signed: shorts PAY dividends
         self.interest_credited: float = 0.0  # idle-cash interest minted
         self.seat_debits: float = 0.0        # hire capital in flight
@@ -548,6 +559,8 @@ class ExchangeServer:
                     await self._handle_seat_request(websocket, incoming, team_id)
                 elif isinstance(incoming, ManualOrder):
                     await self._handle_manual_order(websocket, incoming, team_id)
+                elif isinstance(incoming, IPOSubscribe):
+                    await self._handle_ipo_subscribe(websocket, incoming, team_id)
                 else:
                     await self._send(websocket, ErrorMsg(
                         code="UNEXPECTED_MESSAGE",
@@ -1650,6 +1663,10 @@ class ExchangeServer:
                 if mark:
                     await self._check_stop_triggers(sym, mark)
 
+        # IPO lifecycle: open the book, price it, list the stock.
+        if self.session_open and self.ipos:
+            await self._advance_ipos()
+
         # Short-sale rule triggers: down SSR_TRIGGER_PCT from the open.
         if self.session_open and config.SSR_TRIGGER_PCT > 0:
             for sym, engine in self.price_engines.items():
@@ -1746,8 +1763,13 @@ class ExchangeServer:
     # ------------------------------------------------------------------
 
     async def _advance_calendar(self) -> None:
-        """One calendar tick: announcements, firings, then ramp steps."""
-        tick = self.tick
+        """One calendar tick: announcements, firings, then ramp steps.
+
+        Event ticks are SESSION-RELATIVE ("tick 400" = 400 ticks into the
+        class), so a restored season with tick 6000+ does not detonate the
+        whole calendar at the open.
+        """
+        tick = self.tick - self.session_open_tick
 
         # The priority feed goes out first, to buyers only (calendar_feed).
         early = self.calendar.due_early_announcements(tick)
@@ -2271,6 +2293,7 @@ class ExchangeServer:
 
     async def _complete_open(self) -> None:
         self.session_open = True
+        self.session_open_tick = self.tick
         self.ssr_active.clear()       # a new day clears the short-sale rule
         self._last_season_save = time.time()
         self._start_recording()
@@ -2289,6 +2312,29 @@ class ExchangeServer:
         # is resolved only when each event fires.
         self.calendar.reset()
         await self._announce_calendar()
+
+        # IPOs this week: announce the deals (range, size, window) up front.
+        self.ipos = {}
+        for ev in self.scenario.events:
+            if ev.get("kind") != "ipo":
+                continue
+            deal = ipo_mod.IPOOffering.from_event(ev)
+            if deal is None or deal.symbol in self.books:
+                continue           # already listed in an earlier session
+            self.ipos[deal.symbol] = deal
+            logger.info("IPO ANNOUNCED  %s (%s): %d shares, "
+                        "$%.2f–%.2f, book t%d–t%d, lists t%d",
+                        deal.symbol, deal.name, deal.shares, deal.range_lo,
+                        deal.range_hi, deal.open_tick, deal.close_tick,
+                        deal.list_tick)
+            await self._broadcast(SessionEvent(
+                event="IPO_ANNOUNCE",
+                message=(f"IPO: {deal.name} ({deal.symbol}) — "
+                         f"{deal.shares:,} shares at "
+                         f"${deal.range_lo:.2f}–{deal.range_hi:.2f}; book "
+                         f"opens t{deal.open_tick}, lists t{deal.list_tick}"),
+                data=deal.to_public(),
+            ))
 
         logger.info("━━━  SESSION OPEN  ━━━  week %d (%s)",
                     self.scenario.week, self.scenario.label)
@@ -2333,7 +2379,9 @@ class ExchangeServer:
             "interest_credited": self.interest_credited,
             "seat_debits": self.seat_debits,
             "exchange_revenue": self.exchange_revenue,
+            "ipo_proceeds": self.ipo_proceeds,
         }
+        self.sod_ipo_issued = dict(self.ipo_issued)
 
     async def _write_eod_report(self) -> None:
         """The end-of-day reconciliation: positions, flows, P&L, identities.
@@ -2400,15 +2448,19 @@ class ExchangeServer:
         symbols = set(sod_pos_by_sym) | set(eod_pos_by_sym)
         pos_breaks = {}
         for sym in symbols:
+            issued = (self.ipo_issued.get(sym, 0)
+                      - getattr(self, "sod_ipo_issued", {}).get(sym, 0))
             drift = (eod_pos_by_sym.get(sym, 0) - sod_pos_by_sym.get(sym, 0)
-                     - self.midsession_grants.get(sym, 0))
+                     - self.midsession_grants.get(sym, 0) - issued)
             if drift:
                 pos_breaks[sym] = drift
         # Identity 3: money conservation. Every dollar of team-cash change
         # is explained by named flows; anything else was minted or burned.
         money_base = getattr(self, "sod_money", None) or {
             "dividends_net": 0.0, "interest_credited": 0.0,
-            "seat_debits": 0.0, "exchange_revenue": 0.0}
+            "seat_debits": 0.0, "exchange_revenue": 0.0,
+            "ipo_proceeds": 0.0}
+        money_base.setdefault("ipo_proceeds", 0.0)
         cash_delta = 0.0
         carry_delta = 0.0
         for bot, pf in self.portfolios.items():
@@ -2428,7 +2480,8 @@ class ExchangeServer:
             + (self.dividends_net - money_base["dividends_net"])
             + (self.interest_credited - money_base["interest_credited"])
             - carry_delta
-            - (self.seat_debits - money_base["seat_debits"]))
+            - (self.seat_debits - money_base["seat_debits"])
+            - (self.ipo_proceeds - money_base["ipo_proceeds"]))
         cash_gap = round(cash_delta - explained, 2)
         cash_ok = abs(cash_gap) <= 0.01 * max(1, len(rows))
 
@@ -2450,6 +2503,8 @@ class ExchangeServer:
                     "carry_burned": round(carry_delta, 2),
                     "seat_capital_in_flight": round(
                         self.seat_debits - money_base["seat_debits"], 2),
+                    "ipo_proceeds_to_issuer": round(
+                        self.ipo_proceeds - money_base["ipo_proceeds"], 2),
                 },
             },
             "volume_identity": {
@@ -2461,6 +2516,10 @@ class ExchangeServer:
             "position_conservation": {
                 "ok": not pos_breaks,
                 "midsession_grants": dict(self.midsession_grants),
+                "ipo_issued": {k: v - getattr(self, "sod_ipo_issued", {})
+                               .get(k, 0) for k, v in self.ipo_issued.items()
+                               if v - getattr(self, "sod_ipo_issued", {})
+                               .get(k, 0)},
                 "breaks": pos_breaks,     # symbol → unexplained share drift
             },
         }
@@ -2497,6 +2556,138 @@ class ExchangeServer:
                              f"{market_shares} printed"),
                     data={"checks": checks, "teams": rows[:20]},
                 ))
+
+    async def _advance_ipos(self) -> None:
+        rel = self.tick - self.session_open_tick
+        for deal in list(self.ipos.values()):
+            if deal.state == "announced" and rel >= deal.open_tick:
+                deal.state = "open"
+                logger.info("IPO BOOK OPEN  %s until t%d",
+                            deal.symbol, deal.close_tick)
+                await self._broadcast(SessionEvent(
+                    event="IPO_OPEN",
+                    message=(f"{deal.symbol} book is OPEN — subscribe with "
+                             f"quantity and max price "
+                             f"(${deal.range_lo:.2f}–{deal.range_hi:.2f}) "
+                             f"before t{deal.close_tick}"),
+                    data=deal.to_public(),
+                ))
+            elif deal.state == "open" and rel >= deal.close_tick:
+                await self._price_ipo(deal)
+            elif deal.state == "priced" and rel >= deal.list_tick:
+                await self._list_ipo(deal)
+
+    async def _price_ipo(self, deal) -> None:
+        """Close the book: price, allocate pro-rata, debit the cash."""
+        deal.price_and_allocate(
+            lambda bot: self.portfolios[bot].cash
+            if bot in self.portfolios else 0.0)
+        offer = deal.offer_price
+        placed = 0
+        for bot, qty in deal.allocations.items():
+            pf = self.portfolios.get(bot)
+            if pf is None:
+                continue
+            cost = qty * offer
+            pf.cash -= cost
+            pf.positions[deal.symbol] = (
+                pf.positions.get(deal.symbol, 0) + qty)
+            pf.avg_cost[deal.symbol] = offer
+            self.ipo_proceeds += cost
+            placed += qty
+            ws = self.clients.get(bot)
+            if ws:
+                await self._send(ws, pf.to_message(self.ref_prices))
+        self.ipo_issued[deal.symbol] = (
+            self.ipo_issued.get(deal.symbol, 0) + placed)
+        subscribed = sum(q for q, _ in deal.subs.values())
+        logger.info("IPO PRICED  %s at $%.2f — %d subscribed, %d placed "
+                    "(%d bidders)", deal.symbol, offer, subscribed, placed,
+                    len(deal.allocations))
+        await self._broadcast(SessionEvent(
+            event="IPO_PRICED",
+            message=(f"{deal.symbol} priced at ${offer:.2f} — "
+                     f"{subscribed:,} shares subscribed for "
+                     f"{deal.shares:,} offered; lists t{deal.list_tick}"),
+            data=deal.to_public(),
+        ))
+
+    async def _list_ipo(self, deal) -> None:
+        """Create the security, book and engine; trading starts NOW.
+
+        The market price starts AT the offer while the fundamental sits at
+        the (hidden) true value: the tick-capped engine walks the price
+        toward the truth over the next minutes, and the first prints decide
+        who captured the pop.
+        """
+        sym = deal.symbol
+        offer = deal.offer_price or deal.range_lo
+        true_value = round(offer * ipo_mod.pop_factor(sym), 2)
+
+        import plugins.securities.defaults as securities
+        self.registry.register_security(
+            sym, deal.name, "equity", true_value, "#f0abfc",
+            securities.make_fundamental(sym, sigma=0.7))
+        self.registry.prices[sym] = true_value
+        self.books[sym] = OrderBook(sym, fee_rate=config.FEE_RATE,
+                                    tick_size=config.TICK_SIZE,
+                                    stp_key=self._stp_key)
+        engine = PriceEngine(sym, true_value)
+        engine.market_price = offer          # discovery starts at the offer
+        engine.session_open = offer          # SSR/session-band baseline
+        self.price_engines[sym] = engine
+        self.ref_prices[sym] = offer
+        deal.state = "listed"
+        logger.info("IPO LISTED  %s at $%.2f offer (true value hidden)",
+                    sym, offer)
+        await self._broadcast(SessionEvent(
+            event="IPO_LISTED",
+            message=(f"{sym} is now trading — offered at ${offer:.2f}. "
+                     f"Where it belongs is yours to discover."),
+            data=deal.to_public(),
+        ))
+        await self._broadcast(self._make_snapshot(sym, self.books[sym]))
+
+    async def _handle_ipo_subscribe(
+        self, ws: Any, msg: IPOSubscribe, team_id: str
+    ) -> None:
+        """An indication of interest — from a bot or the portal relay."""
+        bot = msg.team_id
+        if team_id in self.teacher_clients:
+            # Portal path: the dashboard verified the team token; the
+            # exchange re-validates that the bot belongs to that team.
+            if bot not in upgrades.team_bots(msg.team):
+                await self._send(ws, SessionEvent(
+                    event="IPO_SUB_RESULT",
+                    message=f"{bot!r} is not one of {msg.team}'s bots",
+                    data={"ok": False, "request_id": msg.request_id,
+                          "error": f"{bot!r} is not one of your bots"}))
+                return
+        elif bot != team_id:
+            await self._send(ws, ErrorMsg(
+                code="TEAM_MISMATCH",
+                message="team_id does not match your authenticated identity"))
+            return
+
+        deal = self.ipos.get(msg.symbol)
+        if deal is None:
+            ok, detail = False, f"no IPO for {msg.symbol!r}"
+        else:
+            px = msg.max_price if msg.max_price > 0 else deal.range_hi
+            ok, detail = deal.subscribe(bot, msg.quantity, px)
+        if team_id in self.teacher_clients:
+            await self._send(ws, SessionEvent(
+                event="IPO_SUB_RESULT", message=detail,
+                data={"ok": ok, "request_id": msg.request_id,
+                      "detail": detail,
+                      **({} if ok else {"error": detail})}))
+        elif ok:
+            await self._send(ws, SessionEvent(
+                event="IPO_SUB_RESULT", message=detail,
+                data={"ok": True, "symbol": msg.symbol}))
+        else:
+            await self._reject(ws, bot, ErrorMsg(
+                code="IPO_REJECTED", message=detail))
 
     async def close_session(self, persist: bool = True) -> None:
         """Close the session and broadcast the final leaderboard.
@@ -2988,6 +3179,8 @@ class ExchangeServer:
         mid = snap["mid_price"]
         spd = snap["spread"]
         ref = self.ref_prices.get(symbol, 0.0)
+        entry = self.registry.securities.get(symbol) or {}
+        defn = entry.get("defn")
         return BookSnapshot(
             symbol=symbol,
             bids=snap["bids"],
@@ -2995,6 +3188,7 @@ class ExchangeServer:
             mid_price=mid if mid is not None else ref,
             spread=spd if spd is not None else 0.0,
             ref_price=ref,
+            asset_type=getattr(defn, "asset_type", "equity") or "equity",
         )
 
     def _build_leaderboard(self) -> Leaderboard:

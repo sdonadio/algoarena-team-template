@@ -24,6 +24,10 @@ FEE_RATE = float(os.environ.get("ARENA_FEE_RATE", "0.001"))
 # incoming prices toward the passive side. Ticks are what make queue
 # priority real — with infinite granularity, pennying is free.
 TICK_SIZE = float(os.environ.get("ARENA_TICK_SIZE", "0.01"))
+# Self-trade prevention scope: "bot" (an order never matches ITS OWN resting
+# order) or "team" (never matches ANY of its roster team's orders — full
+# firm-level STP, disabling intra-team internalization).
+STP_SCOPE = os.environ.get("STP_SCOPE", "bot").lower()
 
 INITIAL_CASH = 100_000.0          # starting cash for every team
 SNAPSHOT_INTERVAL_SEC = 0.5       # book-snapshot broadcast cadence
@@ -168,6 +172,32 @@ def _read_roster() -> dict:
         return roster if isinstance(roster, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+# What fraction of a bot's allocation a STUDENT venue funds. The roster
+# capital is real money exactly once — at the primary. Before this rule,
+# every venue granted the full allocation, so connecting to N venues minted
+# N× capital (audit finding R2). A quarter is a margin deposit: enough to
+# quote and settle on a secondary venue, not a second fortune.
+SECONDARY_VENUE_CASH_FRACTION = float(
+    os.environ.get("SECONDARY_VENUE_CASH_FRACTION", "0.25"))
+
+
+def venue_cash_fraction() -> float:
+    """1.0 on the primary venue, SECONDARY_VENUE_CASH_FRACTION on a venue
+    whose port belongs to a roster team (a student-licensed venue)."""
+    for team_cfg in _read_roster().values():
+        try:
+            if int(team_cfg.get("exchange_port") or 0) == PORT:
+                return SECONDARY_VENUE_CASH_FRACTION
+        except (TypeError, ValueError):
+            continue
+    return 1.0
+
+
+def funded_cash_for(team_id: str) -> float:
+    """The cash THIS venue actually funds the bot with at first connect."""
+    return starting_cash_for(team_id) * venue_cash_fraction()
 
 
 def starting_cash_for(team_id: str) -> float:

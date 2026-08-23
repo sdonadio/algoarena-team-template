@@ -60,7 +60,7 @@ class PlaceOrder(BaseModel):
     symbol: str
     side: Literal["buy", "sell"]
     order_type: Literal["limit", "market", "ioc", "post_only",
-                        "stop", "stop_limit"]
+                        "stop", "stop_limit", "moc"]
     # Stop orders: held by the venue, armed at stop_price. A stop buy fires
     # when the market trades/marks AT OR ABOVE stop_price (a stop sell at or
     # below); "stop" then executes as a market order, "stop_limit" as a limit

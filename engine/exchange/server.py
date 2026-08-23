@@ -294,7 +294,8 @@ class ExchangeServer:
         # One matching engine per listed security.
         self.books: dict[str, OrderBook] = {
             s.id: OrderBook(s.id, fee_rate=config.FEE_RATE,
-                            tick_size=config.TICK_SIZE)
+                            tick_size=config.TICK_SIZE,
+                            stp_key=self._stp_key)
             for s in self.registry.list_securities()
         }
 
@@ -342,6 +343,14 @@ class ExchangeServer:
         self.sod: dict[str, dict] = {}
         self.sod_market_shares: int = 0
         self.midsession_grants: dict[str, int] = {}
+        # Money-flow counters for the cash-conservation identity (audit R3):
+        # every dollar entering or leaving the participants' pool, by source.
+        # Market-on-close orders: held like stops, injected into the
+        # closing auction book when the pre-close window opens.
+        self.moc_orders: dict[str, dict[str, dict]] = {}
+        self.dividends_net: float = 0.0      # signed: shorts PAY dividends
+        self.interest_credited: float = 0.0  # idle-cash interest minted
+        self.seat_debits: float = 0.0        # hire capital in flight
         self.tick: int = 0
         # Recent fills, bounded so a multi-hour session cannot exhaust memory.
         # Cumulative counts live in trade_count / part_stats (never trimmed).
@@ -461,7 +470,7 @@ class ExchangeServer:
                 new_portfolio = True
                 self.portfolios[team_id] = Portfolio(
                     team_id=team_id, role=msg.role, level=msg.level,
-                    cash=config.starting_cash_for(team_id),
+                    cash=config.funded_cash_for(team_id),
                 )
                 logger.info(
                     "Joined: %-20s  role=%-8s  level=%d",
@@ -821,6 +830,26 @@ class ExchangeServer:
                     ))
                     return
 
+        # ── Market-on-close: held for the closing auction ─────────────
+        if msg.order_type == "moc":
+            if not config.CLOSING_AUCTION:
+                await self._reject(ws, team_id, ErrorMsg(
+                    code="MOC_UNAVAILABLE",
+                    message=("This venue runs no closing auction — "
+                             "market-on-close orders cannot execute"),
+                ))
+                return
+            oid = f"moc-{uuid.uuid4()}"
+            self.moc_orders.setdefault(msg.symbol, {})[oid] = {
+                "order_id": oid, "team_id": team_id, "symbol": msg.symbol,
+                "side": msg.side, "quantity": int(msg.quantity),
+            }
+            await self._send(ws, OrderAck(
+                order_id=oid, team_id=team_id, symbol=msg.symbol,
+                side=msg.side, price=0.0, quantity=msg.quantity,
+            ))
+            return
+
         # ── Stop orders: armed at the venue, not matched now ──────────
         if msg.order_type in ("stop", "stop_limit"):
             if not msg.stop_price or msg.stop_price <= 0:
@@ -887,6 +916,13 @@ class ExchangeServer:
             await self._process_trade(trade)
         if trades:
             await self._check_stop_triggers(msg.symbol, trades[-1].price)
+
+    @staticmethod
+    def _stp_key(team_id: str) -> str:
+        """STP scope resolver: the bot itself, or its whole roster team."""
+        if config.STP_SCOPE == "team":
+            return config.team_of(team_id) or team_id
+        return team_id
 
     async def _reject(self, ws, team_id: str, err) -> None:
         """Send a rejection to the bot AND surface it to the teacher relay.
@@ -974,6 +1010,13 @@ class ExchangeServer:
                     f"{self.quota_for(team_id):.0f} order/cancel messages per tick"
                 ),
             ))
+            return
+
+        # Held MOCs are cancellable until the pre-close injects them.
+        moc = self.moc_orders.get(msg.symbol, {})
+        entry_moc = moc.get(msg.order_id)
+        if entry_moc is not None and entry_moc["team_id"] == team_id:
+            del moc[msg.order_id]
             return
 
         # Armed stops live at the venue, not in the book — check them first.
@@ -1142,6 +1185,7 @@ class ExchangeServer:
         # shows up in exchange_fees_by_team on the leaderboard.
         for bot, amount in shares.items():
             self.portfolios[bot].cash -= amount
+            self.seat_debits += amount
         self.exchange_revenue += cost
 
         logger.info(
@@ -1212,7 +1256,7 @@ class ExchangeServer:
                     else "trader")
             portfolio = Portfolio(
                 team_id=msg.bot_id, role=role, level=1,
-                cash=config.starting_cash_for(msg.bot_id))
+                cash=config.funded_cash_for(msg.bot_id))
             self.portfolios[msg.bot_id] = portfolio
             n = config.STARTING_SHARES_PER_SYMBOL
             if self.session_open and self._session_granted and n > 0:
@@ -1475,8 +1519,10 @@ class ExchangeServer:
         # Buyer and seller already received it directly above.
         await self._broadcast(trade_msg, skip_ids={trade.buyer_id, trade.seller_id})
         await self._broadcast(self._make_snapshot(trade.symbol, self.books[trade.symbol]))
-        # Push a fresh leaderboard so dashboards reflect the fill immediately.
-        await self._broadcast(self._build_leaderboard())
+        # NO leaderboard push here: broadcasting a full leaderboard to every
+        # client per trade is O(clients × trades) and was the load-test
+        # bottleneck (45 conns fine, 90 saturated). The 2-second leaderboard
+        # loop keeps dashboards fresh at a cost that never scales with fills.
 
         logger.info(
             "TRADE %-8s  %-5s  %4d @ %10.4f  buyer=%-18s  seller=%-18s  fee=%.4f",
@@ -1866,6 +1912,7 @@ class ExchangeServer:
             if sym in self.registry.securities:
                 self.registry.securities[sym]["current_price"] = engine.fair_value
 
+        self.dividends_net += paid
         logger.info("DIVIDEND %s $%.2f/share  net cash to holders $%.2f",
                     sym, amount, paid)
         await self._broadcast(SessionEvent(
@@ -1941,7 +1988,9 @@ class ExchangeServer:
                 p.total_carry_paid += carry
             elif p.cash > 0 and config.CASH_INTEREST_PER_TICK > 0:
                 # Netted against carry so a borrower never earns interest too.
-                p.cash += p.cash * config.CASH_INTEREST_PER_TICK
+                interest = p.cash * config.CASH_INTEREST_PER_TICK
+                p.cash += interest
+                self.interest_credited += interest
 
         # Maintenance check: force-liquidate teams below the threshold.
         if config.LIQUIDATION_ENABLED:
@@ -2279,6 +2328,12 @@ class ExchangeServer:
             }
         self.sod_market_shares = sum(
             b._total_volume for b in self.books.values())
+        self.sod_money = {
+            "dividends_net": self.dividends_net,
+            "interest_credited": self.interest_credited,
+            "seat_debits": self.seat_debits,
+            "exchange_revenue": self.exchange_revenue,
+        }
 
     async def _write_eod_report(self) -> None:
         """The end-of-day reconciliation: positions, flows, P&L, identities.
@@ -2349,7 +2404,54 @@ class ExchangeServer:
                      - self.midsession_grants.get(sym, 0))
             if drift:
                 pos_breaks[sym] = drift
+        # Identity 3: money conservation. Every dollar of team-cash change
+        # is explained by named flows; anything else was minted or burned.
+        money_base = getattr(self, "sod_money", None) or {
+            "dividends_net": 0.0, "interest_credited": 0.0,
+            "seat_debits": 0.0, "exchange_revenue": 0.0}
+        cash_delta = 0.0
+        carry_delta = 0.0
+        for bot, pf in self.portfolios.items():
+            if pf.role == "observer":
+                continue
+            base = self.sod.get(bot)
+            if base is None:
+                # Bot funded mid-session: its funding is not a day flow —
+                # diff against its own funded starting cash.
+                cash_delta += pf.cash - pf.starting_cash
+                carry_delta += pf.total_carry_paid
+            else:
+                cash_delta += pf.cash - base["cash"]
+                carry_delta += pf.total_carry_paid - base["carry"]
+        explained = (
+            (money_base["exchange_revenue"] - self.exchange_revenue)  # fees out
+            + (self.dividends_net - money_base["dividends_net"])
+            + (self.interest_credited - money_base["interest_credited"])
+            - carry_delta
+            - (self.seat_debits - money_base["seat_debits"]))
+        cash_gap = round(cash_delta - explained, 2)
+        cash_ok = abs(cash_gap) <= 0.01 * max(1, len(rows))
+
         checks = {
+            "cash_conservation": {
+                "ok": cash_ok,
+                "sum_team_cash_delta": round(cash_delta, 2),
+                "explained_by_flows": round(explained, 2),
+                "unexplained_gap": cash_gap,
+                "flows": {
+                    "fees_to_venue": round(
+                        self.exchange_revenue
+                        - money_base["exchange_revenue"], 2),
+                    "dividends_net": round(
+                        self.dividends_net - money_base["dividends_net"], 2),
+                    "interest_credited": round(
+                        self.interest_credited
+                        - money_base["interest_credited"], 2),
+                    "carry_burned": round(carry_delta, 2),
+                    "seat_capital_in_flight": round(
+                        self.seat_debits - money_base["seat_debits"], 2),
+                },
+            },
             "volume_identity": {
                 "ok": volume_ok,
                 "sum_shares_bought": tot_bought,
@@ -2378,11 +2480,13 @@ class ExchangeServer:
         (out_dir / f"eod_{stamp}.json").write_text(
             json.dumps(report, indent=2) + "\n")
 
-        status = ("PASS" if volume_ok and not pos_breaks else "FAIL")
+        status = ("PASS" if volume_ok and not pos_breaks and cash_ok
+                  else "FAIL")
         logger.info(
-            "EOD RECON %s  bought=%d sold=%d market=%d  pos_breaks=%s  → %s",
+            "EOD RECON %s  bought=%d sold=%d market=%d  pos_breaks=%s  "
+            "cash_gap=$%.2f  → %s",
             status, tot_bought, tot_sold, market_shares,
-            pos_breaks or "none", out_dir / f"eod_{stamp}.json")
+            pos_breaks or "none", cash_gap, out_dir / f"eod_{stamp}.json")
         for teacher in self.teacher_clients:
             tws = self.clients.get(teacher)
             if tws:
@@ -2412,6 +2516,20 @@ class ExchangeServer:
             self._pending_close_persist = persist
             for book in self.books.values():
                 book.auction_mode = True
+            # Inject held MOC orders into the closing books as always-
+            # eligible limits: an MOC takes the clearing price, whatever
+            # it is, so its limit is far beyond any plausible cross.
+            for sym, pending in self.moc_orders.items():
+                book = self.books.get(sym)
+                ref = self.ref_prices.get(sym) or 0.0
+                if book is None or ref <= 0:
+                    continue
+                for entry in pending.values():
+                    px = ref * (1.5 if entry["side"] == "buy" else 0.5)
+                    book.place_order(team_id=entry["team_id"],
+                                     side=entry["side"], price=px,
+                                     quantity=entry["quantity"])
+            self.moc_orders.clear()
             logger.info("━━━  PRE-CLOSE  ━━━  closing cross in %d ticks",
                         self.auction_ticks_left)
             await self._broadcast(SessionEvent(
@@ -2436,6 +2554,7 @@ class ExchangeServer:
         for book in self.books.values():
             book.auction_mode = False
         self.stop_orders.clear()      # stops are day orders
+        self.moc_orders.clear()
         if was_open:
             self.snapshot_equity(force=True)
             self.sessions_played += 1

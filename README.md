@@ -50,7 +50,7 @@ dashboard.
 
 ## 4. Develop
 
-- `team/trader.py` → `MyStrategy.generate_signal()` — your edge
+- `team/trader.py` → `MyTrader.on_tick()` — your edge
 - `team/broker.py` → quoting + inventory management (Level 4 keeps you solvent)
 - Test offline, no network needed: `make sim` and `make test`
 

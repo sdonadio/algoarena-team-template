@@ -82,7 +82,7 @@ What happens when a bot starts:
 3. On success it receives the current order books and leaderboard. If the
    session is already open it activates immediately; otherwise it waits for
    the teacher's START.
-4. From then on: your `MyStrategy.generate_signal()` runs every tick, orders
+4. From then on: your `MyTrader.on_tick()` runs every tick, orders
    go out, fills and portfolio updates come back.
 
 Bots reconnect automatically if the connection drops — you can also just
@@ -108,8 +108,9 @@ Open the arena address in a browser and **sign in with your team token**:
 
 ## 5. Iterate
 
-Your edge lives in `team/trader.py` (`MyStrategy.generate_signal()`) and
-`team/broker.py`. The loop is:
+Your edge lives in `team/trader.py` (`MyTrader.on_tick()`) and
+`team/broker.py` (`MyBroker.spread()/skew()`) — small classes deriving the
+`arena` SDK bases, which handle all plumbing. The loop is:
 
 ```bash
 make test          # offline unit tests (no network)

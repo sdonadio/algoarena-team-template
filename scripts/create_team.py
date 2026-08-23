@@ -258,8 +258,8 @@ CAPITAL = {plan["capital"]!r}
         (pkg_dir / "trader.py").write_text(f'''"""
 {name} — trader bot.
 
-This starter runs the standard TraderBot plumbing with YOUR strategy
-plugged in. Edit MyStrategy.generate_signal() — that is your edge.
+Implement on_tick(): decide a trade (or None) each tick. Everything else —
+connection, auth, portfolio tracking — is handled by the base class.
 
 Run one seat:
     TEAM_ID={plan["trader_ids"][0]} python -m {module}.trader
@@ -267,33 +267,34 @@ Run one seat:
 
 from __future__ import annotations
 
-import asyncio
-
-from trader.trader import Signal, Strategy, TraderBot
+from arena import Signal, Trader
 
 
-class MyStrategy(Strategy):
+class MyTrader(Trader):
     """Your alpha lives here."""
 
-    def generate_signal(self, market, portfolio):
+    def on_tick(self, market, portfolio):
         # TODO: implement your strategy.
         #
         # You can read:
-        #   market.prices[symbol]      current mid price
-        #   market.history[symbol]     recent price history (deque)
-        #   market.books[symbol]       latest book snapshot (bids/asks)
+        #   market.symbols()           tradeable symbols
+        #   market.mid_price(sym)      current mid price
+        #   market.prices(sym)         recent mids, oldest first
+        #   market.best_bid/best_ask   the touch
         #   portfolio.cash             your cash
         #   portfolio.positions        symbol → shares held
         #
         # Return a Signal(symbol=..., side="buy"/"sell", quantity=..., price=...)
         # to trade, or None to sit out this tick.
-        return super().generate_signal(market, portfolio)
+        return None
+
+    # Optional extra hooks:
+    #   def on_fill(self, side, symbol, quantity, price): ...
+    #   def on_event(self, event, message, data): ...   # shocks, calendar
 
 
 if __name__ == "__main__":
-    bot = TraderBot()
-    bot.strategy = MyStrategy()
-    asyncio.run(bot.run())
+    MyTrader().run()
 ''')
 
     if plan["broker_ids"]:
@@ -301,9 +302,9 @@ if __name__ == "__main__":
 {name} — broker (market maker).
 
 Posts two-sided quotes and earns the spread plus maker rebates on every
-passive fill. Inventory management (Level 4 quote skewing) is the key to
-staying solvent — the exchange charges margin interest and liquidates
-teams below maintenance.
+passive fill. Three decisions, three methods — override any of them.
+Inventory management (skew) is the key to staying solvent: the exchange
+charges margin interest and liquidates teams below maintenance.
 
 Run:
     TEAM_ID={plan["broker_ids"][0]} python -m {module}.broker
@@ -311,18 +312,64 @@ Run:
 
 from __future__ import annotations
 
-import asyncio
-
-from broker.broker import BrokerBot
+from arena import Broker
 
 
-class MyBroker(BrokerBot):
-    """Your market-making logic. Override quoting methods here."""
-    # TODO Level 4: skew your quotes based on inventory.
+class MyBroker(Broker):
+    """Your market-making logic. An empty subclass already quotes."""
+
+    def spread(self, symbol, price, history):
+        # TODO Level 3: widen your quotes when the market gets choppy.
+        # `history` is the recent reference prices, oldest first.
+        # Return the dollar width, or None for the fixed default.
+        return None
+
+    def skew(self, symbol, inventory):
+        # TODO Level 4: shift both quotes to flatten your inventory.
+        # Long (inventory > 0) → quote lower to attract sellers.
+        return None
+
+    # Optional extra hooks:
+    #   def toxic(self, trader_id): ...                 # Level 5
+    #   def on_fill(self, side, symbol, quantity, price): ...
 
 
 if __name__ == "__main__":
-    asyncio.run(MyBroker().run())
+    MyBroker().run()
+''')
+
+    if plan["exchange_port"]:
+        (pkg_dir / "exchange.py").write_text(f'''"""
+{name} — your exchange venue (port {plan["exchange_port"]}).
+
+The matching engine, settlement, and market data are provided. You set
+policy: the fee schedule you publish, and the orders you accept.
+
+Run:
+    EXCHANGE_PORT={plan["exchange_port"]} python -m {module}.exchange
+"""
+
+from __future__ import annotations
+
+from arena import Exchange
+
+
+class MyExchange(Exchange):
+    """Your venue policy."""
+
+    # TODO: pick your published fee schedule (bps of notional).
+    # Undercut the arena's 15/10 to attract flow, or charge premium.
+    # Every trader sees it on the dashboard (STATS → venue fee schedules).
+    taker_bps = None      # None → class default
+    rebate_bps = None
+
+    # Optional extra hooks:
+    #   def accept_order(self, order, portfolio): return True, ""
+    #   def on_trade(self, symbol, price, quantity, buyer_id, seller_id): ...
+
+
+if __name__ == "__main__":
+    MyExchange().run()
 ''')
 
     lines = [f"# {name}", "", f"Budget invested: ${TEAM_BUDGET:,}", ""]
@@ -336,9 +383,13 @@ if __name__ == "__main__":
         lines += [f"- 🤖 `{tid}` (${plan['capital'][tid]:,}):", "",
                   f"      TEAM_ID={tid} python -m {module}.trader", ""]
     lines += ["## Where to write code", "",
-              "- `trader.py` → `MyStrategy.generate_signal()` — your edge",
-              "- `broker.py` → quoting and inventory management",
-              "- `config.py` → your tunables"]
+              "- `trader.py` → `MyTrader.on_tick()` — your edge",
+              "- `broker.py` → `MyBroker.spread()/skew()` — quoting and inventory",
+              *(["- `exchange.py` → `MyExchange` — your fee schedule and policy"]
+                if plan["exchange_port"] else []),
+              "- `config.py` → your tunables", "",
+              "Each class derives an `arena` base that handles all plumbing —",
+              "see `from arena import Trader, Broker, Exchange`."]
     (pkg_dir / "README.md").write_text("\n".join(lines) + "\n")
 
 

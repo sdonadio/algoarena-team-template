@@ -11,5 +11,5 @@ jobs:
       - run: PYTHONPATH=. pytest tests/ -q
       - name: bots import cleanly
         run: |
-          python -c "import trader.trader, broker.broker, exchange.server"
+          python -c "import arena, trader.trader, broker.broker, exchange.server"
           if [ -d team ]; then python -c "import team.config"; fi

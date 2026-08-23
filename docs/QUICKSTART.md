@@ -43,7 +43,7 @@ The wizard then generates your team's code package:
 students/<your_team>/
 ├── README.md    ← your exact run commands
 ├── config.py    ← your tunables
-├── trader.py    ← MyStrategy.generate_signal() — write your edge here
+├── trader.py    ← MyTrader.on_tick() — write your edge here
 └── broker.py    ← quoting + inventory management (if you bought a desk)
 ```
 

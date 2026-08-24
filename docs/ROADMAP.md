@@ -8,6 +8,11 @@ table; the arena enforces week gates, so code shipped early simply waits.
 Roles: 🤖 Trader · 🏦 Broker · 🏛 Exchange. Your team does the rows for the
 seats it owns.
 
+Note on paths: `engine/…` is the **student template** layout —
+`scripts/make_template_repo.py` copies the engine packages into `engine/`.
+In this repo the same files live at `shared/`, `exchange/`, `broker/`,
+`trader/`.
+
 ---
 
 ## Level 1 — Connect (Weeks 1–2)
@@ -45,6 +50,7 @@ Already working in your starters. Your job is to run it and understand it.
 | 🤖 | **Stop-loss** — close positions past `STOP_LOSS_PCT` | `RiskManager.check_stop_loss` (TODO Level 4) |
 | 🏦 | **Inventory management** — skew quotes to shed exposure; this is what keeps you solvent under margin calls | `team/broker.py → skew(symbol, inventory)` |
 | 🏛 | **Circuit breakers** — halt a symbol after an outsized move, auto-resume | `engine/shared/orderbook.py` (TODO Level 4) |
+| 🏛 | *(advanced)* **LULD limit states** — pause trading at the band edge before escalating to a halt, the way real LULD does | `engine/exchange/circuit_breaker.py`; band config `LULD_BAND_PCT` |
 | 🏛 | *(advanced)* Kyle's lambda — volume-weighted permanent impact | `engine/exchange/price_engine.py` (TODO Level 4) |
 
 ## Level 5 — The meta-game (Weeks 6–7) · *purchase window opens week 7*
@@ -56,6 +62,7 @@ Already working in your starters. Your job is to run it and understand it.
 | 🏦 | **Toxic flow detection** — identify counterparties who pick you off, stop quoting to them. The retail/VWAP background flow gives you a baseline to segment against. | `team/broker.py → toxic(trader_id)` |
 | 🏦 | *(advanced)* **Iceberg quotes** — show small, reload from reserve; the venue only sees the tip | build it client-side: requote a slice on each fill |
 | 🏛 | **Rate limiting**: order-to-trade ratio enforcement + per-team order quotas | `engine/shared/orderbook.py` (TODO Level 5), `engine/exchange/config.py` `MAX_ORDERS_PER_MIN_PER_TEAM` |
+| 🏛 | *(advanced)* **Odd and round lots** — accept odd lots but exclude them from the published BBO, the way real venues quote in round lots | `engine/shared/orderbook.py` + `engine/exchange/server.py` snapshot code |
 | 🏛 | **Detect the whale**: the institutional VWAP slicer fires on a fixed clock — find it in your venue's flow analytics | `team/exchange.py → on_trade()` |
 
 ## The IPO weeks (3 and 8)
@@ -76,6 +83,7 @@ Already working in your starters. Your job is to run it and understand it.
 | 🏦 | Multi-exchange quoting from one pricing brain | handled by the SDK — your job is tuning it per venue |
 | 🏛 | **VWAP + analytics endpoint** — broadcast VWAP, expose venue stats worth paying for | `engine/exchange/server.py` (TODO Level 6) |
 | 🏛 | *(advanced)* **Pegged orders** — quotes that track the NBBO midpoint automatically; consume `GET /api/nbbo` | new order type: your venue, your rules |
+| 🏛 | *(advanced)* **Market-data tiering** — sell depth-of-book as a paid upgrade: free tier gets top-of-book, subscribers get the full ladder | `engine/exchange/server.py` snapshots + the upgrade shop (`engine/exchange/upgrades.py`) |
 | 🤖 | **Auction strategy**: the opening cross publishes indicative price and imbalance every tick — trade the imbalance, or game the close (MOC manipulation is a compliance lecture waiting to happen) | `on_event("AUCTION_INDICATIVE")` |
 
 ---

@@ -124,4 +124,9 @@ TEAM_ID=my_team_name         # override config.py without editing it
 make test
 ```
 
-All 215 tests should pass before you submit.
+The full test suite (1,150+ tests) should pass before you submit.
+
+---
+
+Heads up for IPO weeks (3 and 8): a new symbol lists mid-session — see
+`docs/SEASON_GUIDE.md` §5c for how the primary market works.

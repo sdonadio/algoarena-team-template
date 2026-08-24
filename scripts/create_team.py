@@ -300,6 +300,9 @@ class MyTrader(Trader):
     # Optional extra hooks:
     #   def on_fill(self, side, symbol, quantity, price): ...
     #   def on_event(self, event, message, data): ...   # shocks, calendar
+    #   def on_ipo(self, symbol, lo, hi, shares, data): ...
+    #       # An IPO book opened — return qty (bids top of range) or
+    #       # (qty, max_price) as your indication, None to pass.
 
 
 if __name__ == "__main__":

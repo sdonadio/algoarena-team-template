@@ -359,6 +359,16 @@ class ExchangeServer:
         self.ipos: dict[str, ipo_mod.IPOOffering] = {}
         self.ipo_issued: dict[str, int] = {}   # shares created by listings
         self.ipo_proceeds: float = 0.0         # cash paid to the issuer
+        # Season-persistent primary-market state. `listed_ipos` carries every
+        # security this venue ever listed (symbol → name/offer/last price) so
+        # a restart re-registers it and positions stay tradeable; it doubles
+        # as the durable done-once guard — the in-memory `symbol in books`
+        # check dies with the process, and re-running a week must never
+        # re-mint a deal on top of live holdings.
+        self.listed_ipos: dict[str, dict] = {}
+        # Cumulative per-bot primary-market allocations (shares), for the
+        # gradebook: who played the IPO weeks and how hard.
+        self.ipo_allocations: dict[str, int] = {}
         self.dividends_net: float = 0.0      # signed: shorts PAY dividends
         self.interest_credited: float = 0.0  # idle-cash interest minted
         self.seat_debits: float = 0.0        # hire capital in flight
@@ -536,6 +546,26 @@ class ExchangeServer:
                           "scenario": self.scenario.to_dict(),
                           "late_join": True},
                 ))
+                # Replay live primary-market state: on_ipo fires off the
+                # IPO_OPEN broadcast, so without this a bot that connects
+                # (or crash-reconnects) during the window is silently
+                # excluded from the deal.
+                for deal in self.ipos.values():
+                    if deal.state == "announced":
+                        await self._send(websocket, SessionEvent(
+                            event="IPO_ANNOUNCE",
+                            message=(f"IPO: {deal.name} ({deal.symbol}) — "
+                                     f"book opens t{deal.open_tick}, "
+                                     f"lists t{deal.list_tick}"),
+                            data=dict(deal.to_public(), late_join=True),
+                        ))
+                    elif deal.state == "open":
+                        await self._send(websocket, SessionEvent(
+                            event="IPO_OPEN",
+                            message=(f"{deal.symbol} book is OPEN — "
+                                     f"subscribe before t{deal.close_tick}"),
+                            data=dict(deal.to_public(), late_join=True),
+                        ))
 
             # ── Message loop ─────────────────────────────────────────
             async for raw_msg in websocket:
@@ -1100,6 +1130,15 @@ class ExchangeServer:
             await self.announce_fee_schedule(old)
         elif cmd == "lift_circuit_breakers":
             await self.lift_circuit_breakers()
+        elif cmd == "ipo_announce":
+            ok, detail = await self.teacher_announce_ipo(msg.params)
+            if not ok:
+                await self._send(ws, ErrorMsg(code="BAD_IPO", message=detail))
+        elif cmd == "ipo_cancel":
+            ok, detail = await self.teacher_cancel_ipo(
+                str(msg.params.get("symbol", "")))
+            if not ok:
+                await self._send(ws, ErrorMsg(code="BAD_IPO", message=detail))
         else:
             await self._send(ws, ErrorMsg(
                 code="UNKNOWN_COMMAND", message=f"Unknown teacher command: {cmd!r}",
@@ -2313,15 +2352,29 @@ class ExchangeServer:
         self.calendar.reset()
         await self._announce_calendar()
 
-        # IPOs this week: announce the deals (range, size, window) up front.
+        # IPOs this week. Issuance is primary-market business: every venue
+        # loads the same scenario, so without a gate each student venue
+        # would independently book, price and mint the same deal — a bot on
+        # two venues would be allocated (and pay) twice. The primary runs
+        # the full lifecycle; a secondary venue tracks the deal silently
+        # and simply LISTS the security at list-tick (no book, no shares,
+        # no cash) so the name trades everywhere — arbitrage, not the
+        # issuer, keeps the venues' prints coherent.
         self.ipos = {}
+        self.ipo_issuance = config.is_primary_venue()
         for ev in self.scenario.events:
             if ev.get("kind") != "ipo":
                 continue
             deal = ipo_mod.IPOOffering.from_event(ev)
             if deal is None or deal.symbol in self.books:
                 continue           # already listed in an earlier session
+            if deal.symbol in self.listed_ipos:
+                continue           # done in a prior season session (durable)
             self.ipos[deal.symbol] = deal
+            if not self.ipo_issuance:
+                logger.info("IPO %s: secondary venue — will list at t%d "
+                            "without issuance", deal.symbol, deal.list_tick)
+                continue
             logger.info("IPO ANNOUNCED  %s (%s): %d shares, "
                         "$%.2f–%.2f, book t%d–t%d, lists t%d",
                         deal.symbol, deal.name, deal.shares, deal.range_lo,
@@ -2390,8 +2443,9 @@ class ExchangeServer:
 
           1. Σ shares bought = Σ shares sold = market volume — every share
              bought was sold by someone, and the venue counted each print once.
-          2. Σ EOD positions − Σ SOD positions = mid-session grants, per
-             symbol — trades only MOVE inventory; only grants create it.
+          2. Σ EOD positions − Σ SOD positions = mid-session grants plus
+             IPO issuance, per symbol — trades only MOVE inventory; only
+             grants and primary-market allocations create it.
           3. Per team: ΔNW = Δrealized + Δunrealized − Δfees + Δrebates
              − Δcarry + other cash flows (dividends/interest/variation) —
              reported per team so an attribution gap is visible.
@@ -2533,9 +2587,13 @@ class ExchangeServer:
             "teams": rows,
         }
 
-        out_dir = pathlib.Path("data") / "reports"
+        # REPORTS_DIR so containers can point at the mounted volume; the
+        # port in the name so venues closing in the same second (multi-venue
+        # weeks) never interleave writes into one corrupt file.
+        out_dir = pathlib.Path(
+            os.environ.get("REPORTS_DIR", str(pathlib.Path("data") / "reports")))
         out_dir.mkdir(parents=True, exist_ok=True)
-        stamp = time.strftime("%Y%m%d_%H%M%S")
+        stamp = f"{time.strftime('%Y%m%d_%H%M%S')}_p{config.PORT}"
         (out_dir / f"eod_{stamp}.json").write_text(
             json.dumps(report, indent=2) + "\n")
 
@@ -2557,8 +2615,78 @@ class ExchangeServer:
                     data={"checks": checks, "teams": rows[:20]},
                 ))
 
+    async def teacher_announce_ipo(self, params: dict) -> tuple[bool, str]:
+        """Launch an ad-hoc deal mid-session (teacher command).
+
+        Ticks are relative to session open, the same clock the scenario
+        events use — a window already in the past simply opens on the next
+        tick. Primary venue only, like every other issuance path.
+        """
+        if not self.session_open:
+            return False, "no session open"
+        if not config.is_primary_venue():
+            return False, "IPOs are announced at the primary venue only"
+        deal = ipo_mod.IPOOffering.from_event(
+            {"symbol": params.get("symbol"),
+             "name": params.get("name", params.get("symbol")),
+             "shares": params.get("shares"),
+             "offer_range": [params.get("range_lo"), params.get("range_hi")],
+             "window": [params.get("open_tick"), params.get("close_tick")],
+             "tick": params.get("list_tick")})
+        if deal is None:
+            return False, ("params required: symbol, shares, range_lo, "
+                           "range_hi, open_tick, close_tick, list_tick")
+        if (deal.shares <= 0 or deal.range_lo <= 0
+                or deal.range_hi < deal.range_lo
+                or not deal.open_tick < deal.close_tick <= deal.list_tick):
+            return False, "shares/range/window make no sense"
+        if (deal.symbol in self.books or deal.symbol in self.ipos
+                or deal.symbol in self.listed_ipos):
+            return False, f"{deal.symbol} already exists or already dealt"
+        self.ipos[deal.symbol] = deal
+        logger.info("IPO ANNOUNCED (teacher)  %s: %d shares, $%.2f–%.2f",
+                    deal.symbol, deal.shares, deal.range_lo, deal.range_hi)
+        await self._broadcast(SessionEvent(
+            event="IPO_ANNOUNCE",
+            message=(f"IPO: {deal.name} ({deal.symbol}) — "
+                     f"{deal.shares:,} shares at "
+                     f"${deal.range_lo:.2f}–{deal.range_hi:.2f}; book "
+                     f"opens t{deal.open_tick}, lists t{deal.list_tick}"),
+            data=deal.to_public(),
+        ))
+        return True, f"{deal.symbol} announced"
+
+    async def teacher_cancel_ipo(self, symbol: str) -> tuple[bool, str]:
+        """Pull a deal (teacher command). Only before pricing — once cash
+        has moved the deal is history, not an intention."""
+        deal = self.ipos.get(symbol)
+        if deal is None:
+            return False, f"no live IPO for {symbol!r}"
+        if deal.state not in ("announced", "open"):
+            return False, (f"{symbol} is already {deal.state} — "
+                           f"cash has moved, cannot cancel")
+        del self.ipos[symbol]
+        logger.info("IPO CANCELLED  %s (was %s)", symbol, deal.state)
+        await self._broadcast(SessionEvent(
+            event="IPO_CANCELLED",
+            message=f"The {deal.name} ({symbol}) offering has been withdrawn.",
+            data=dict(deal.to_public(), state="cancelled"),
+        ))
+        return True, f"{symbol} cancelled"
+
     async def _advance_ipos(self) -> None:
         rel = self.tick - self.session_open_tick
+        if not getattr(self, "ipo_issuance", True):
+            # Secondary venue: no book, no allocation, no minting — just
+            # list the name at list-tick so it trades here too. The listing
+            # anchor is the range midpoint; the primary's print and the
+            # arbitrageurs converge the venues within a few ticks.
+            for deal in list(self.ipos.values()):
+                if deal.state != "listed" and rel >= deal.list_tick:
+                    deal.offer_price = round(
+                        (deal.range_lo + deal.range_hi) / 2, 2)
+                    await self._list_ipo(deal)
+            return
         for deal in list(self.ipos.values()):
             if deal.state == "announced" and rel >= deal.open_tick:
                 deal.state = "open"
@@ -2594,12 +2722,23 @@ class ExchangeServer:
                 pf.positions.get(deal.symbol, 0) + qty)
             pf.avg_cost[deal.symbol] = offer
             self.ipo_proceeds += cost
+            self.ipo_allocations[bot] = (
+                self.ipo_allocations.get(bot, 0) + qty)
             placed += qty
             ws = self.clients.get(bot)
             if ws:
                 await self._send(ws, pf.to_message(self.ref_prices))
         self.ipo_issued[deal.symbol] = (
             self.ipo_issued.get(deal.symbol, 0) + placed)
+        # Durable from the moment money moves: cash and positions are
+        # committed above, so a restart between pricing and listing must
+        # still restore the security (and must never re-run the deal).
+        self.listed_ipos[deal.symbol] = {
+            "name": deal.name,
+            "offer_price": offer,
+            "week": self.scenario.week,
+            "listed": False,
+        }
         subscribed = sum(q for q, _ in deal.subs.values())
         logger.info("IPO PRICED  %s at $%.2f — %d subscribed, %d placed "
                     "(%d bidders)", deal.symbol, offer, subscribed, placed,
@@ -2612,6 +2751,30 @@ class ExchangeServer:
             data=deal.to_public(),
         ))
 
+    def _register_listed_security(self, sym: str, name: str,
+                                  offer: float, market_price: float) -> None:
+        """Register an IPO'd security into the live venue.
+
+        Shared by listing day (market starts AT the offer) and season
+        restore (market resumes at the last checkpointed price). The
+        fundamental is redrawn from the deterministic pop, so every process
+        that ever lists `sym` agrees on where the truth sits.
+        """
+        true_value = round(offer * ipo_mod.pop_factor(sym), 2)
+        import plugins.securities.defaults as securities
+        self.registry.register_security(
+            sym, name, "equity", true_value, "#f0abfc",
+            securities.make_fundamental(sym, sigma=0.7))
+        self.registry.prices[sym] = true_value
+        self.books[sym] = OrderBook(sym, fee_rate=config.FEE_RATE,
+                                    tick_size=config.TICK_SIZE,
+                                    stp_key=self._stp_key)
+        engine = PriceEngine(sym, true_value)
+        engine.market_price = market_price
+        engine.session_open = market_price   # SSR/session-band baseline
+        self.price_engines[sym] = engine
+        self.ref_prices[sym] = market_price
+
     async def _list_ipo(self, deal) -> None:
         """Create the security, book and engine; trading starts NOW.
 
@@ -2622,22 +2785,12 @@ class ExchangeServer:
         """
         sym = deal.symbol
         offer = deal.offer_price or deal.range_lo
-        true_value = round(offer * ipo_mod.pop_factor(sym), 2)
-
-        import plugins.securities.defaults as securities
-        self.registry.register_security(
-            sym, deal.name, "equity", true_value, "#f0abfc",
-            securities.make_fundamental(sym, sigma=0.7))
-        self.registry.prices[sym] = true_value
-        self.books[sym] = OrderBook(sym, fee_rate=config.FEE_RATE,
-                                    tick_size=config.TICK_SIZE,
-                                    stp_key=self._stp_key)
-        engine = PriceEngine(sym, true_value)
-        engine.market_price = offer          # discovery starts at the offer
-        engine.session_open = offer          # SSR/session-band baseline
-        self.price_engines[sym] = engine
-        self.ref_prices[sym] = offer
+        self._register_listed_security(sym, deal.name, offer, offer)
         deal.state = "listed"
+        rec = self.listed_ipos.setdefault(
+            sym, {"name": deal.name, "offer_price": offer,
+                  "week": self.scenario.week})
+        rec["listed"] = True
         logger.info("IPO LISTED  %s at $%.2f offer (true value hidden)",
                     sym, offer)
         await self._broadcast(SessionEvent(
@@ -2814,6 +2967,29 @@ class ExchangeServer:
             self.tick = int(state.get("tick", 0))
             self.exchange_revenue = float(state.get("exchange_revenue", 0.0))
             self.sessions_played = int(state.get("sessions_played", 0))
+            ipo_state = state.get("ipo") or {}
+            self.ipo_issued = {str(k): int(v) for k, v in
+                               (ipo_state.get("issued") or {}).items()}
+            self.ipo_proceeds = float(ipo_state.get("proceeds", 0.0))
+            self.ipo_allocations = {str(k): int(v) for k, v in
+                                    (ipo_state.get("allocations") or {}).items()}
+            self.listed_ipos = {}
+            for sym, raw in (ipo_state.get("listed") or {}).items():
+                rec = {"name": str(raw.get("name", sym)),
+                       "offer_price": float(raw.get("offer_price", 0.0)),
+                       "week": int(raw.get("week", 0)),
+                       "listed": bool(raw.get("listed", True))}
+                self.listed_ipos[str(sym)] = rec
+                if str(sym) in self.books:
+                    continue
+                # Re-register the security so the positions students carried
+                # out of the IPO week stay tradeable and marked. Trading
+                # resumes at the last checkpointed price, not the offer.
+                last = float(raw.get("last_price") or rec["offer_price"])
+                self._register_listed_security(
+                    str(sym), rec["name"], rec["offer_price"], last)
+                logger.info("Season restore: relisted %s at $%.2f "
+                            "(IPO week %d)", sym, last, rec["week"])
         except (TypeError, ValueError) as exc:
             logger.warning("Season file malformed (%s) — starting fresh", exc)
             return False
@@ -2858,6 +3034,19 @@ class ExchangeServer:
         self._last_equity_snapshot_tick = 0
         self._season_dirty = True
         self.calendar.reset()
+        # The primary market resets with the season: delist every IPO'd
+        # security and forget the deals, or the durable done-once guard
+        # would block the fresh season's IPO weeks forever.
+        for sym in list(self.listed_ipos):
+            self.books.pop(sym, None)
+            self.price_engines.pop(sym, None)
+            self.ref_prices.pop(sym, None)
+            self.registry.unregister_security(sym)
+        self.listed_ipos.clear()
+        self.ipos.clear()
+        self.ipo_issued.clear()
+        self.ipo_allocations.clear()
+        self.ipo_proceeds = 0.0
         logger.warning("━━━  NEW SEASON  ━━━  all season state wiped")
         await self._broadcast(SessionEvent(
             event="NEW_SEASON",

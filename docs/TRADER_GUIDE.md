@@ -115,6 +115,36 @@ The `Signal` object accepts a `confidence` field (0–1) you can use for sizing.
 
 ---
 
+## The primary market: on_ipo
+
+In IPO weeks (3 and 8) a new symbol lists mid-session. Your SDK hook
+(`arena/trader.py`) is:
+
+```python
+def on_ipo(self, symbol: str, lo: float, hi: float, shares: int,
+           data: dict) -> int | tuple[int, float] | None:
+```
+
+Return your **indication of interest**, or `None` to pass:
+
+- a bare quantity — bids the **top** of the range (the sure allocation), or
+- `(quantity, max_price)` — bid tighter and risk missing the deal.
+
+One indication per bot, like a real book: resubmitting **replaces** your
+previous indication. Cash is only debited if you are allocated at pricing.
+
+The deal lifecycle arrives as events (also visible in `on_event`):
+
+- **`IPO_OPEN`** — the book is open; `data` carries `symbol`, `offer_range`,
+  and `shares`. This is when `on_ipo` fires.
+- **`IPO_PRICED`** — the deal priced off the book; allocations are pro-rata
+  when oversubscribed, and your cash is debited for whatever you got.
+- **`IPO_LISTED`** — the symbol starts trading. The price opens at the offer
+  and walks toward its hidden value — it may pop above the offer or break
+  below it. Momentum vs fade on listing day is your call.
+
+---
+
 ## Scoring
 
 Your **net worth at session close** determines your rank:
@@ -125,7 +155,7 @@ unrealized P&L = sum of (current_price − avg_entry_price) × qty for open posi
 ```
 
 At `SESSION_CLOSED`, your bot flattens everything.  Open positions are marked to
-the Alpaca mid price (not your fill price), so execution quality matters.
+the Yahoo mid price (not your fill price), so execution quality matters.
 
 **Tips:**
 - Fees are 0.1% of notional — overtrading kills P&L faster than bad signals.

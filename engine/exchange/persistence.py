@@ -102,6 +102,21 @@ def build_state(server: Any) -> dict[str, Any]:
             tid: [[int(t), float(v)] for t, v in hist]
             for tid, hist in server.equity_history.items()
         },
+        # Primary-market state: which deals already happened (the durable
+        # done-once guard) and what each listed security needs to be
+        # re-registered on restart — without this, a restart strands every
+        # IPO position in a symbol the venue no longer knows.
+        "ipo": {
+            "listed": {
+                sym: dict(rec, last_price=float(
+                    server.ref_prices.get(sym) or rec.get("offer_price", 0.0)))
+                for sym, rec in server.listed_ipos.items()
+            },
+            "issued": {k: int(v) for k, v in server.ipo_issued.items()},
+            "proceeds": float(server.ipo_proceeds),
+            "allocations": {k: int(v)
+                            for k, v in server.ipo_allocations.items()},
+        },
     }
 
 

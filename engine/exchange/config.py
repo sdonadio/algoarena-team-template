@@ -200,6 +200,16 @@ def funded_cash_for(team_id: str) -> float:
     return starting_cash_for(team_id) * venue_cash_fraction()
 
 
+def is_primary_venue() -> bool:
+    """True on the primary (teacher-run) venue.
+
+    Primary-only activities — capital funding at 100%, and the primary
+    market (IPOs) — key off this. A student-licensed venue running the
+    same week scenario must not mint the same deal a second time.
+    """
+    return venue_cash_fraction() >= 1.0
+
+
 def starting_cash_for(team_id: str) -> float:
     """Return the capital allocated to this bot in the roster, or INITIAL_CASH."""
     for team_cfg in _read_roster().values():

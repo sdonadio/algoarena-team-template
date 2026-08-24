@@ -81,7 +81,9 @@ class CancelOrder(BaseModel):
 class TeacherCommand(BaseModel):
     """Sent by teacher-role clients to control the session remotely.
 
-    Recognised commands: open_session, close_session, inject_shock, set_fee_rate.
+    Recognised commands: open_session, close_session, end_session,
+    new_season, set_week, inject_shock, set_fee_rate, fee_schedule,
+    lift_circuit_breakers, ipo_announce, ipo_cancel.
     Extra arguments go in params (e.g. {"shock_id": "flash_crash"}).
     """
 

@@ -101,6 +101,8 @@ class CalendarEvent:
 def event_from_dict(raw: dict[str, Any]) -> CalendarEvent | None:
     """Parse one scenario event entry. Returns None if it is unusable."""
     kind = str(raw.get("kind", ""))
+    if kind == "ipo":
+        return None        # not the calendar's business — server._advance_ipos
     if kind not in (EARNINGS, ECON_PRINT, DIVIDEND):
         logger.warning("Calendar: ignoring unknown event kind %r", kind)
         return None

@@ -1,6 +1,6 @@
 # Broker Team Guide
 
-You are the market maker. You connect to Alpaca for real prices, then post
+You are the market maker. You poll Yahoo Finance for real prices, then post
 bid/ask quotes on the exchange.  Your edge is the spread you earn; your risk
 is the inventory you accumulate.
 
@@ -10,12 +10,12 @@ is the inventory you accumulate.
 
 You run a **market-making bot** that:
 
-1. Subscribes to Alpaca's paper-trading WebSocket for real-time equity and crypto prices.
-2. Continuously posts a bid (buy) and an ask (sell) on the exchange, centered on the Alpaca mid.
+1. Polls Yahoo Finance (via yfinance) for real-time equity prices — no API keys needed.
+2. Continuously posts a bid (buy) and an ask (sell) on the exchange, centered on the venue mark.
 3. Earns the spread when both sides fill.
 4. Manages inventory to avoid being too long or too short any single name.
 
-The Alpaca connection and exchange quoting scaffolding are already in `broker/broker.py`.  
+The Yahoo Finance polling and exchange quoting scaffolding are already in `broker/broker.py`.  
 Your job is to tune the parameters and implement the progressively harder TODOs.
 
 ---
@@ -23,13 +23,12 @@ Your job is to tune the parameters and implement the progressively harder TODOs.
 ## How to run it
 
 ```bash
-export ALPACA_API_KEY=your_key
-export ALPACA_API_SECRET=your_secret
 make broker
 # or: python -m broker.broker
 ```
 
-Without Alpaca keys the bot starts but won't quote (it has no prices).  
+No API keys are needed — the bot polls Yahoo Finance via `yfinance` every
+`YAHOO_POLL_INTERVAL` seconds (default 5).  
 For offline testing use `make sim` — the simulated exchange provides synthetic prices.
 
 ---
@@ -101,6 +100,18 @@ ignored with a warning.)
 - Route quotes to whichever exchange has the highest fill rate for a given symbol
 - Verify: run two exchange instances, confirm fills split between them
 
+### Quote the new name *(IPO weeks — 3 and 8)*
+- When an IPO lists mid-session, nobody has inventory except allocants —
+  spreads are wide and the first market maker in earns them
+  (see `docs/ROADMAP.md`, "The IPO weeks")
+- The reference broker auto-discovers new listings: `IPO_LISTED` symbols join
+  the quoting universe the moment they list, so your tuned spread/skew logic
+  applies to the new name automatically
+- If you replaced the discovery logic, make sure your bot picks up symbols it
+  did not know at startup
+- Verify: run a week-3 scenario, confirm your bot quotes the listing within a
+  few requote cycles of `IPO_LISTED`
+
 ---
 
 ## Scoring
@@ -109,7 +120,7 @@ Your score = spread income − inventory losses:
 
 - **Spread income** = (ask fill price − bid fill price) × quantity / 2 per round trip
 - **Inventory loss** = net position × adverse price move (can go very negative)
-- **Net worth** = cash + mark-to-market positions (marked to Alpaca mid at session close)
+- **Net worth** = cash + mark-to-market positions (marked to Yahoo mid at session close)
 
 The broker with the highest net worth at session close wins.  
 Being flat (zero inventory) at the close is usually better than holding a position.

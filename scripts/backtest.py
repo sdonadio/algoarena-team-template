@@ -234,15 +234,19 @@ def resolve_strategy(module_path: str, class_name: str | None) -> tuple[object, 
     else:
         # Strategy itself counts when the module *defines* it, which is how the
         # trader/trader.py template is backtested; a student module that merely
-        # imports Strategy is filtered out by the __module__ check.
+        # imports Strategy is filtered out by the __module__ check. Arena-SDK
+        # traders (subclass arena.Trader, hook on_tick) count equally — that
+        # is what team/trader.py and every generated team package define.
+        from arena.trader import Trader as _SDKTrader
         subclasses = [
-            obj for _, obj in _module_classes(module) if issubclass(obj, Strategy)
+            obj for _, obj in _module_classes(module)
+            if issubclass(obj, (Strategy, _SDKTrader))
         ]
         if not subclasses:
             raise StrategyError(
-                f"no subclass of trader.trader.Strategy is defined in "
-                f"{module_path}. Re-run with --class <name>. Candidates:\n"
-                f"{_candidate_report(module)}"
+                f"no subclass of trader.trader.Strategy or arena.Trader is "
+                f"defined in {module_path}. Re-run with --class <name>. "
+                f"Candidates:\n{_candidate_report(module)}"
             )
         cls = subclasses[0]
 
@@ -255,6 +259,12 @@ def resolve_strategy(module_path: str, class_name: str | None) -> tuple[object, 
 
     if callable(getattr(instance, "generate_signal", None)):
         return instance, cls.__name__
+    if callable(getattr(instance, "on_tick", None)):
+        # An arena-SDK trader (team/trader.py, students/*/trader.py): its
+        # on_tick(market, portfolio) IS generate_signal under another name —
+        # the same adapter the live bot uses (arena._AdapterStrategy).
+        from arena.trader import _AdapterStrategy
+        return _AdapterStrategy(instance), cls.__name__
     if callable(getattr(instance, "signal", None)):
         _console.print(
             f"[yellow]{cls.__name__} has no generate_signal() — wrapping its "
@@ -262,8 +272,9 @@ def resolve_strategy(module_path: str, class_name: str | None) -> tuple[object, 
         )
         return _TupleSignalAdapter(instance), cls.__name__
     raise StrategyError(
-        f"{cls.__name__} exposes neither generate_signal(market, portfolio) nor "
-        f"signal(market, portfolio), so it cannot be backtested. Candidates:\n"
+        f"{cls.__name__} exposes none of generate_signal(market, portfolio), "
+        f"on_tick(market, portfolio), or signal(market, portfolio), so it "
+        f"cannot be backtested. Candidates:\n"
         f"{_candidate_report(module)}"
     )
 

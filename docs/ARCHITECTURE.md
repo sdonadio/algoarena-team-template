@@ -25,7 +25,8 @@ Python processes that communicate exclusively over WebSockets:
                         ┌─────────────────────────────────────────┐
                         │             EXCHANGE SERVER              │
                         │                                          │
-  Alpaca ──► Broker ───►│  OrderBook  ──►  Portfolio tracker       │
+   Yahoo ──► Broker ───►│  OrderBook  ──►  Portfolio tracker       │
+ (yfinance)             │                                          │
                         │      ▲                  │                │
               Trader ───►│  matching    ◄──  ArenaRegistry          │
                         │      │            (plugins)              │
@@ -39,7 +40,7 @@ Python processes that communicate exclusively over WebSockets:
 | Role | What it does | Scores on |
 |------|-------------|-----------|
 | Exchange | Runs the CLOB, collects fees | Fee revenue + uptime |
-| Broker | Posts bid/ask quotes using Alpaca prices | Spread income − inventory risk |
+| Broker | Posts bid/ask quotes using Yahoo Finance prices | Spread income − inventory risk |
 | Trader | Runs an algorithmic strategy | Net worth at session close |
 
 There is no shared database, no REST API, and no message broker.
@@ -56,38 +57,73 @@ algoarena/
 │
 ├── shared/                  ← The contract. Imported by everyone.
 │   ├── messages.py          ← All Pydantic message schemas + parse_message()
-│   └── orderbook.py         ← CLOB matching engine (pure logic, no I/O)
+│   ├── orderbook.py         ← CLOB matching engine (pure logic, no I/O)
+│   ├── auth.py              ← Team token auth (hosted deployments)
+│   └── roster.py            ← Team roster loading/validation
 │
 ├── plugins/                 ← The registry. Never talks to the network.
 │   ├── __init__.py          ← ArenaRegistry class + global `arena` instance
 │   ├── securities/defaults.py  ← shared deterministic fundamental per symbol
+│   ├── securities/futures.py   ← ARENA10 index future
 │   ├── shocks/defaults.py   ← Shock event functions
 │   └── strategies/examples.py  ← Example signal functions
 │
-├── exchange/                ← Exchange team's process
+├── exchange/                ← The exchange engine
 │   ├── server.py            ← WebSocket server, Portfolio, price tick loop
-│   └── config.py            ← HOST, PORT, FEE_RATE, SYMBOLS
+│   ├── config.py            ← HOST, PORT, fee schedules, feature flags
+│   ├── price_engine.py      ← Venue mark: microprice + fundamental blend
+│   ├── ipo.py               ← Primary market: bookbuild → pricing →
+│   │                           allocation → listing
+│   ├── circuit_breaker.py   ← LULD bands, halts, SSR
+│   ├── scenario.py          ← Week scenario loader (teacher/season/*.json)
+│   ├── scoring.py           ← Season scoring and leaderboard math
+│   ├── seats.py, upgrades.py, calendar.py, limits.py
+│   └── persistence.py       ← Season state → data/season.json
 │
-├── broker/                  ← Broker team's process
-│   ├── broker.py            ← Alpaca feed, cancel-then-requote loop
-│   └── config.py            ← TEAM_ID, EXCHANGE_URL, Alpaca keys, spread params
+├── broker/                  ← Broker engine (reference market maker)
+│   ├── broker.py            ← yfinance polling feed, cancel-then-requote loop
+│   └── config.py            ← TEAM_ID, EXCHANGE_URL, YAHOO_POLL_INTERVAL,
+│                               spread params
 │
-├── trader/                  ← Trader team's process
+├── trader/                  ← Trader engine + bot templates
 │   ├── trader.py            ← MarketData, Portfolio, RiskManager, Strategy
-│   └── config.py            ← TEAM_ID, EXCHANGE_URL, risk params
+│   ├── config.py            ← TEAM_ID, EXCHANGE_URL, risk params
+│   └── arb_trader.py, shock_trader.py, flow_bots.py  ← house bots
 │
-└── teacher/                 ← Teacher-only tools (not graded)
-    ├── web_dashboard.py     ← Browser dashboard (HTTP + WS relay)
-    ├── dashboard.py         ← Terminal Rich dashboard
-    └── shock_tool.py        ← Interactive shock injector
+├── arena/                   ← Student SDK — thin hook layer over the engine
+│   ├── trader.py            ← on_tick / on_fill / on_event / on_ipo
+│   ├── broker.py            ← spread / skew / toxic hooks
+│   └── exchange.py          ← exchange policy hooks
+│
+├── team/                    ← Per-team starter (generated, git-ignored)
+├── students/                ← Registered team packages (one per team)
+│
+├── sim/                     ← Headless season simulator (no network)
+│
+├── teacher/                 ← Teacher-only tools (not graded)
+│   ├── web_dashboard.py     ← Browser dashboard (HTTP + WS relay) — primary UI
+│   ├── portal.py, registration.py  ← Student registration
+│   ├── season/              ← week01.json … week10.json scenarios
+│   ├── teams.json           ← Seed roster (mutated at runtime)
+│   ├── dashboard.py         ← Terminal Rich dashboard (deprecated)
+│   └── shock_tool.py        ← Interactive shock injector (deprecated)
+│
+├── scripts/                 ← Ops tooling: create_team, launch_bots,
+│                               load_test, replay_session, grade_export, …
+├── deploy/                  ← Hosted deploy kit (systemd + Caddy + backups)
+└── data/, sessions/         ← Runtime state and recordings (git-ignored)
 ```
 
-**Dependency rules:**
+**Dependency rules (the layer cake):**
 
 - `shared/` has no imports from the rest of the project.
 - `plugins/` imports only from `shared/`.
-- `exchange/`, `broker/`, `trader/` import from `shared/` and `plugins/`.
-- Nothing imports from `exchange/`, `broker/`, or `trader/` (they are leaf processes).
+- `exchange/`, `broker/`, `trader/` are **the engine**: they import from
+  `shared/` and `plugins/`, never from each other's process internals.
+- `arena/` wraps the engine for students — it imports `exchange/`, `broker/`,
+  and `trader/` and exposes them as small hook classes.
+- `team/` and `students/` sit on top of `arena/` (as do `sim/` and
+  `scripts/create_team.py`, which drive the engine directly).
 
 ---
 
@@ -468,7 +504,7 @@ for trade in trades:
 ## 8. Adding a New Broker
 
 A broker is a WebSocket **client** that connects to the exchange, reads prices
-from somewhere (Alpaca or a custom feed), and continuously posts bid/ask pairs.
+from somewhere (Yahoo Finance or a custom feed), and continuously posts bid/ask pairs.
 
 ### Minimal custom broker
 
@@ -490,7 +526,7 @@ async def main():
         await ws.send(hs.model_dump_json())
 
         # 2. Wait for SESSION_OPEN, then quote
-        mid = 182.50   # replace with real Alpaca price
+        mid = 182.50   # replace with a real Yahoo Finance price
 
         while True:
             bid_order = PlaceOrder(
@@ -508,28 +544,35 @@ async def main():
 asyncio.run(main())
 ```
 
-### Plugging in Alpaca (the real broker)
+### Plugging in a real feed (the reference broker)
 
-The full `broker/broker.py` connects Alpaca in a **daemon thread** (Alpaca's
-SDK uses its own event loop) and schedules updates on the asyncio loop using
-`asyncio.run_coroutine_threadsafe`:
+The full `broker/broker.py` polls Yahoo Finance in a **daemon thread**
+(yfinance is blocking HTTP with no WebSocket API, so it stays off the asyncio
+loop). The thread writes into a plain dict; the async requote loop reads it:
 
 ```python
-def _alpaca_callback(quote):
-    symbol = quote.symbol
-    new_mid = (quote.bid_price + quote.ask_price) / 2
-    self._alpaca_prices[symbol] = new_mid
-    # Trigger a requote on the asyncio loop from this non-async callback:
-    asyncio.run_coroutine_threadsafe(
-        self._requote(symbol), self._loop
-    )
-
-def start_alpaca_feeds(self):
+def start_yahoo_feeds(self):
     self._loop = asyncio.get_event_loop()
-    stream = StockDataStream(ALPACA_API_KEY, ALPACA_API_SECRET)
-    stream.subscribe_quotes(self._alpaca_callback, *EQUITY_SYMBOLS)
-    threading.Thread(target=stream.run, daemon=True).start()
+    threading.Thread(
+        target=self._yahoo_poll_loop,
+        args=(config.EQUITY_SYMBOLS,),
+        daemon=True, name="yahoo-feed",
+    ).start()
+
+def _yahoo_poll_loop(self, symbols):
+    import yfinance as yf
+    while True:
+        for sym in symbols:
+            price = float(yf.Ticker(sym).fast_info.last_price)
+            if price > 0:
+                self.state.yahoo_prices[sym] = price
+        time.sleep(config.YAHOO_POLL_INTERVAL)
 ```
+
+No API keys are needed, and `fast_info.last_price` returns the last traded
+price even when markets are closed — the game works on weekends. To swap in
+any other data source (a paid feed, a recorded file, another venue), replace
+the poll loop: anything that keeps `state.yahoo_prices` fresh will do.
 
 ### Adding a second broker with a different strategy
 
@@ -545,7 +588,7 @@ tightest spread that isn't picked off by informed traders wins.
 ### Broker state machine
 
 ```
-start_alpaca_feeds()        ← starts background threads
+start_yahoo_feeds()         ← starts the yfinance polling thread
         │
 connect_to_exchange()       ← opens WebSocket, sends Handshake
         │

@@ -134,10 +134,10 @@ enable something the engine does not otherwise support.
 |------|-------|---------|
 | 1 | Paper trading — nothing counts | long-only, limit/market only, limit 200, **not scored** |
 | 2 | Season starts | short selling, scoring begins, limit 400 |
-| 3 | Signals & earnings season | earnings calendar, dividends, limit 600 |
-| 4 | Market making | post-only, **purchase window 1**, limit 800 |
-| 5 | Risk | circuit breakers + liquidation drama |
-| 6 | Midterm tournament | limit 1000, dense event calendar |
+| 3 | Signals & earnings season | earnings calendar, dividends, **the ORCA IPO**, limit 600 |
+| 4 | Market making | post-only, opening auction, **purchase window 1**, limit 800 |
+| 5 | Risk | circuit breakers + liquidation drama (maintenance 0.5) |
+| 6 | Scenario tournament | limit 1000, dense calendar + **the VLTA IPO** — the ten assessed scenarios run this session (MIDTERM_SCENARIOS.md); the closed-book MCQ midterm is the same week |
 | 7 | Execution | rate quotas, cancellation fees, latency tiers, **purchase window 2** |
 | 8 | Multi-venue | routing and fee competition across team exchanges (see §8b) |
 | 9 | ARENA-10 index future | cash-settled index future, broker hedging |

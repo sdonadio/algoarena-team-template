@@ -10,6 +10,7 @@ from shared.messages import (
     CancelOrder,
     ErrorMsg,
     Handshake,
+    IPOSubscribe,
     Leaderboard,
     OrderAck,
     PlaceOrder,
@@ -258,6 +259,42 @@ class TestBookSnapshot:
         raw = round_trip(msg)
         assert raw["bids"] == []
         assert raw["asks"] == []
+
+    def test_asset_type_round_trips(self):
+        msg = BookSnapshot(
+            symbol="ARENA10", bids=[], asks=[], mid_price=100.0, spread=0.0,
+            asset_type="future",
+        )
+        raw = round_trip(msg)
+        assert raw["asset_type"] == "future"
+
+    def test_asset_type_defaults_to_equity(self):
+        # An older venue's payload has no asset_type; the field must default
+        # so brokers can keep keying their quoting universe off it.
+        raw = json.loads(BookSnapshot(
+            symbol="X", bids=[], asks=[], mid_price=1.0, spread=0.0,
+        ).model_dump_json())
+        raw.pop("asset_type", None)
+        assert parse_message(raw).asset_type == "equity"
+
+
+class TestIPOSubscribe:
+    def test_round_trip(self):
+        msg = IPOSubscribe(team_id="alpha_trader_1", symbol="ORCA",
+                           quantity=250, max_price=27.5, team="Team Alpha")
+        round_trip(msg)
+
+    def test_type_discriminator(self):
+        msg = IPOSubscribe(team_id="t1", symbol="ORCA", quantity=1)
+        assert msg.type == "ipo_subscribe"
+
+    def test_max_price_defaults_to_top_of_range_sentinel(self):
+        msg = IPOSubscribe(team_id="t1", symbol="ORCA", quantity=10)
+        assert msg.max_price == 0.0 and msg.team == ""
+
+    def test_missing_quantity(self):
+        with pytest.raises(ValidationError):
+            IPOSubscribe(team_id="t1", symbol="ORCA")
 
 
 class TestPortfolioUpdate:

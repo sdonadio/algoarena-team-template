@@ -2,7 +2,7 @@
 tests/sim_session.py — full end-to-end AlgoArena simulation, no network required.
 
 Runs the exchange, broker, and trader(s) in a single process using direct
-function calls instead of WebSockets.  No Alpaca API keys needed.
+function calls instead of WebSockets.  No network or market-data feed needed.
 
 Usage as a script:
     python -m tests.sim_session
@@ -261,7 +261,7 @@ class SimulatedExchange:
     def local_prices(self) -> dict[str, float]:
         """Raw GBM/sine prices from the plugin's price_fn.
 
-        This is the equivalent of Alpaca prices in the real system — the
+        This is the equivalent of Yahoo Finance prices in the real system — the
         external truth that drives the broker's requoting.  Always returns
         the most recent price computed by advance_tick(), independent of
         what the order book currently shows.
@@ -349,7 +349,7 @@ class SimulatedBroker:
 
     def _quote_symbol(self, symbol: str) -> None:
         # Use the GBM/sine price (local_prices) as the mid reference, same
-        # role as Alpaca prices in the live system.  ref_prices can lag after
+        # role as the Yahoo feed in the live system.  ref_prices can lag after
         # a trade fill; local_prices is always the freshest computed price.
         mid = self.exchange.local_prices.get(symbol)
         if mid is None:

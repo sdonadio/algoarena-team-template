@@ -243,13 +243,15 @@ The exchange grants each bot its allocated capital when it connects.
 Environment variables:
     TEAM_ID         which bot this process is
     ARENA_TOKEN     your team's secret token (from registration — see .env)
+    EXCHANGE_URL    full exchange URL (wss://… for a TLS-hosted arena;
+                    set at registration — see .env)
     EXCHANGE_HOST   exchange hostname (default: localhost)
     EXCHANGE_PORT   exchange port     (default: 8765)
 """
 
 import os
 
-EXCHANGE_URL = (
+EXCHANGE_URL = os.environ.get("EXCHANGE_URL") or (
     f"ws://{{os.environ.get('EXCHANGE_HOST', 'localhost')}}"
     f":{{os.environ.get('EXCHANGE_PORT', '8765')}}"
 )
@@ -488,12 +490,18 @@ def register_remote(payload: dict, url: str, code: str) -> None:
     host = url.split("//")[-1].split("/")[0].split(":")[0]
 
     # Save credentials (gitignored) and generate the starter package.
+    # A TLS-hosted arena (https://…) proxies the exchange WebSocket at
+    # wss://feed.<domain> (see deploy/Caddyfile) — never plain ws://, or the
+    # team token would travel in cleartext.
     env = pathlib.Path(".env")
-    env.write_text(
+    env_text = (
         f"# {result['team']} — issued at registration. Do NOT commit or share.\n"
         f"ARENA_TOKEN={result['token']}\n"
         f"EXCHANGE_HOST={host}\n"
     )
+    if url.startswith("https://"):
+        env_text += f"EXCHANGE_URL=wss://feed.{host}\n"
+    env.write_text(env_text)
     write_package(plan, pathlib.Path("team"), "team")
 
     print(f"""

@@ -10,7 +10,9 @@ Environment variables:
 import os
 
 TEAM_ID = os.environ.get("TEAM_ID", "broker_alpha")
-EXCHANGE_URL = (
+# EXCHANGE_URL: full URL override, e.g. wss://feed.arena.example.edu
+# (TLS-hosted play); otherwise built from EXCHANGE_HOST/EXCHANGE_PORT.
+EXCHANGE_URL = os.environ.get("EXCHANGE_URL") or (
     f"ws://{os.environ.get('EXCHANGE_HOST', 'localhost')}"
     f":{os.environ.get('EXCHANGE_PORT', '8765')}"
 )

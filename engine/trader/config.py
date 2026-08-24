@@ -2,6 +2,8 @@
 Trader configuration. Change TEAM_ID to your team name before running.
 
 Environment variables:
+    EXCHANGE_URL    Full exchange URL, e.g. wss://feed.arena.example.edu
+                    (TLS-hosted play — overrides host/port)
     EXCHANGE_HOST   Override exchange hostname (default: localhost)
     EXCHANGE_PORT   Override exchange port (default: 8765)
 """
@@ -9,7 +11,7 @@ Environment variables:
 import os
 
 TEAM_ID = os.environ.get("TEAM_ID", "trader_alpha")
-EXCHANGE_URL = (
+EXCHANGE_URL = os.environ.get("EXCHANGE_URL") or (
     f"ws://{os.environ.get('EXCHANGE_HOST', 'localhost')}"
     f":{os.environ.get('EXCHANGE_PORT', '8765')}"
 )

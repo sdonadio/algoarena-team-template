@@ -49,6 +49,7 @@ from exchange.price_engine import PriceEngine
 from shared.messages import (
     BookSnapshot,
     CancelOrder,
+    CommandAck,
     ErrorMsg,
     Handshake,
     Leaderboard,
@@ -1094,13 +1095,30 @@ class ExchangeServer:
 
         cmd = msg.command
         if cmd == "open_session":
+            # Ack no-ops explicitly: on hosted deployments the session
+            # auto-opens, so START from the dashboard is usually a no-op —
+            # without feedback that reads as a dead button.
+            already = bool(self.session_open or self.auction_phase)
             await self.open_session()
+            await self._send(ws, CommandAck(
+                command=cmd, ok=not already,
+                detail=("session already open — nothing to do" if already
+                        else "session opening")))
         elif cmd == "close_session":
+            noop = not (self.session_open or self.auction_phase)
             await self.close_session()
+            await self._send(ws, CommandAck(
+                command=cmd, ok=not noop,
+                detail=("session already closed — nothing to do" if noop
+                        else "session closing")))
         elif cmd == "end_session":
             await self.end_session()
+            await self._send(ws, CommandAck(
+                command=cmd, detail="session ended — week banked"))
         elif cmd == "new_season":
             await self.new_season()
+            await self._send(ws, CommandAck(
+                command=cmd, detail="new season — all season state wiped"))
         elif cmd == "set_week":
             try:
                 week = int(msg.params["week"])
@@ -1109,12 +1127,16 @@ class ExchangeServer:
                     code="MISSING_PARAM", message="week (int) required"))
                 return
             await self.set_week(week)
+            await self._send(ws, CommandAck(
+                command=cmd, detail=f"week set to {week}"))
         elif cmd == "inject_shock":
             shock_id = msg.params.get("shock_id", "")
             if not shock_id:
                 await self._send(ws, ErrorMsg(code="MISSING_PARAM", message="shock_id required"))
                 return
             await self.inject_shock(shock_id, msg.params.get("shock_params"))
+            await self._send(ws, CommandAck(
+                command=cmd, detail=f"shock fired: {shock_id}"))
         elif cmd == "set_fee_rate":
             try:
                 rate = float(msg.params["rate"])
@@ -1130,6 +1152,8 @@ class ExchangeServer:
             await self.announce_fee_schedule(old)
         elif cmd == "lift_circuit_breakers":
             await self.lift_circuit_breakers()
+            await self._send(ws, CommandAck(
+                command=cmd, detail="circuit breakers lifted"))
         elif cmd == "ipo_announce":
             ok, detail = await self.teacher_announce_ipo(msg.params)
             if not ok:

@@ -257,6 +257,21 @@ class ErrorMsg(BaseModel):
     message: str
 
 
+class CommandAck(BaseModel):
+    """The exchange's reply to a TeacherCommand — success OR no-op.
+
+    Sent only to the commanding teacher connection. `ok` is False when the
+    command was valid but had nothing to do (e.g. open_session while the
+    session is already open) — the dashboard surfaces `detail` as a toast
+    so a no-op never looks like a dead button.
+    """
+
+    type: Literal["command_ack"] = "command_ack"
+    command: str
+    ok: bool = True
+    detail: str = ""
+
+
 # ---------------------------------------------------------------------------
 # Plugin-related types (not transmitted over the wire — used inside the engine)
 # ---------------------------------------------------------------------------
@@ -326,6 +341,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "leaderboard": Leaderboard,
     "session_event": SessionEvent,
     "error": ErrorMsg,
+    "command_ack": CommandAck,
     "signal": Signal,
     "shock_result": ShockResult,
     "security_def": SecurityDef,

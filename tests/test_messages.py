@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from shared.messages import (
     BookSnapshot,
     CancelOrder,
+    CommandAck,
     ErrorMsg,
     Handshake,
     IPOSubscribe,
@@ -370,6 +371,19 @@ class TestSessionEvent:
     def test_default_empty_data(self):
         msg = SessionEvent(event="TEST", message="hello")
         assert msg.data == {}
+
+
+class TestCommandAck:
+    def test_round_trip(self):
+        msg = CommandAck(command="open_session", ok=False,
+                         detail="session already open — nothing to do")
+        round_trip(msg)
+
+    def test_defaults_and_discriminator(self):
+        msg = CommandAck(command="set_week")
+        assert msg.type == "command_ack"
+        assert msg.ok is True
+        assert msg.detail == ""
 
 
 class TestErrorMsg:

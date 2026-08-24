@@ -60,6 +60,7 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import random
@@ -836,10 +837,24 @@ class TraderBot:
                 await self.connect()
                 self._session_open = False   # reset gate on each reconnect
                 self.market = MarketData()   # clear stale book state
-                await asyncio.gather(
-                    self.listen(),
-                    self.trading_loop(),
-                )
+                # listen() ends when the connection drops — by RAISING on an
+                # abnormal drop, but by RETURNING when the venue closes
+                # cleanly (a restarting exchange sends a close frame, so the
+                # `async for` just ends). gather()-ing it with the infinite
+                # trading loop therefore hung forever on clean closes and the
+                # bot never reconnected: the trading loop must die with the
+                # connection.
+                listener = asyncio.create_task(self.listen())
+                trading = asyncio.create_task(self.trading_loop())
+                try:
+                    await listener
+                finally:
+                    trading.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await trading
+                logger.warning(
+                    "Exchange closed the connection — reconnecting in %.0fs",
+                    retry_delay)
             except websockets.exceptions.ConnectionClosed as exc:
                 logger.warning("Exchange connection closed: %s — reconnecting in %.0fs", exc, retry_delay)
             except OSError as exc:

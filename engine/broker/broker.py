@@ -31,6 +31,7 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import math
@@ -648,10 +649,21 @@ class BrokerBot:
             try:
                 await self.connect_to_exchange()
                 self._session_open = False
-                await asyncio.gather(
-                    self.listen_to_exchange(),
-                    self.requote_loop(),
-                )
+                # Same shape as the trader: the listen loop RETURNS on a
+                # clean close (a restarting venue sends a close frame), so
+                # gather()-ing it with the infinite requote loop hung forever
+                # and the broker never reconnected.
+                listener = asyncio.create_task(self.listen_to_exchange())
+                requoter = asyncio.create_task(self.requote_loop())
+                try:
+                    await listener
+                finally:
+                    requoter.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await requoter
+                logger.warning(
+                    "Exchange closed the connection — reconnecting in %.0fs",
+                    retry_delay)
             except websockets.exceptions.ConnectionClosed as exc:
                 logger.warning("Exchange connection closed: %s — reconnecting in %.0fs",
                                exc, retry_delay)

@@ -677,8 +677,12 @@ class BrokerBot:
                     await self.cancel_all_quotes()
                 except Exception:
                     pass
-                if self._ws and not self._ws.closed:
-                    await self._ws.close()
+                if self._ws:
+                    # close() is idempotent; the legacy `.closed` attribute
+                    # is gone in websockets >= 12 (this line only runs on the
+                    # reconnect path, which the hang bug kept unreachable).
+                    with contextlib.suppress(Exception):
+                        await self._ws.close()
             await asyncio.sleep(retry_delay)
 
 

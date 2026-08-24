@@ -45,10 +45,15 @@ if _engine.is_dir() and str(_engine) not in _sys.path:
     _sys.path.insert(0, str(_engine))
 del _pathlib, _sys, _engine
 
+# Credentials from `make register` (.env) — loaded before any config module
+# reads os.environ. Variables already set in the shell always win.
+from shared.envfile import load_env as _load_env
+_load_env()
+
 from shared.messages import Signal
 
 from arena.broker import Broker
 from arena.exchange import Exchange
-from arena.trader import Trader
+from arena.trader import Trader, as_signal_fn
 
-__all__ = ["Trader", "Broker", "Exchange", "Signal"]
+__all__ = ["Trader", "Broker", "Exchange", "Signal", "as_signal_fn"]

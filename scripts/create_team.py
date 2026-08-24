@@ -225,6 +225,37 @@ def confirm(plan: dict, interactive: bool) -> None:
 
 # ── Code generation ───────────────────────────────────────────────────────────
 
+def _write_starter(dest: pathlib.Path, text: str) -> None:
+    """Write a starter code file WITHOUT clobbering student work.
+
+    Re-running `make register` (name change, failed first attempt) must
+    never destroy what a student wrote: an existing, different file is left
+    in place and the fresh starter goes to <name>.new alongside it.
+    """
+    if dest.exists() and dest.read_text() != text:
+        alt = dest.with_name(dest.name + ".new")
+        alt.write_text(text)
+        print(f"  ⚠ {dest} already has your code — kept it; fresh starter "
+              f"written to {alt}")
+        return
+    dest.write_text(text)
+
+
+def _write_generated(dest: pathlib.Path, text: str) -> None:
+    """Write a registration artifact (config/README), backing up any edits.
+
+    Unlike starter code, these must reflect the CURRENT registration (bot
+    ids, capital) or every downstream step breaks — so they are replaced,
+    with the previous version saved to <name>.bak if it differed.
+    """
+    if dest.exists() and dest.read_text() != text:
+        bak = dest.with_name(dest.name + ".bak")
+        bak.write_text(dest.read_text())
+        print(f"  ⚠ {dest} updated for this registration — previous version "
+              f"saved to {bak}")
+    dest.write_text(text)
+
+
 def write_package(plan: dict, pkg_dir: pathlib.Path, module: str) -> None:
     """Generate the starter code package for a team.
 
@@ -234,7 +265,7 @@ def write_package(plan: dict, pkg_dir: pathlib.Path, module: str) -> None:
     pkg_dir.mkdir(parents=True, exist_ok=True)
     (pkg_dir / "__init__.py").write_text(f'"""{name} — AlgoArena team package."""\n')
 
-    (pkg_dir / "config.py").write_text(f'''"""
+    _write_generated(pkg_dir / "config.py", f'''"""
 {name} — team configuration.
 
 Your bot IDs and capital allocation were set at registration.
@@ -251,6 +282,12 @@ Environment variables:
 
 import os
 
+try:                       # credentials from `make register` (.env);
+    from shared.envfile import load_env   # shell variables still win
+    load_env()
+except ImportError:        # standalone import without the engine on sys.path
+    pass
+
 EXCHANGE_URL = os.environ.get("EXCHANGE_URL") or (
     f"ws://{{os.environ.get('EXCHANGE_HOST', 'localhost')}}"
     f":{{os.environ.get('EXCHANGE_PORT', '8765')}}"
@@ -266,7 +303,7 @@ CAPITAL = {plan["capital"]!r}
 ''')
 
     if plan["trader_ids"]:
-        (pkg_dir / "trader.py").write_text(f'''"""
+        _write_starter(pkg_dir / "trader.py", f'''"""
 {name} — trader bot.
 
 Implement on_tick(): decide a trade (or None) each tick. Everything else —
@@ -312,7 +349,7 @@ if __name__ == "__main__":
 ''')
 
     if plan["broker_ids"]:
-        (pkg_dir / "broker.py").write_text(f'''"""
+        _write_starter(pkg_dir / "broker.py", f'''"""
 {name} — broker (market maker).
 
 Posts two-sided quotes and earns the spread plus maker rebates on every
@@ -353,7 +390,7 @@ if __name__ == "__main__":
 ''')
 
     if plan["exchange_port"]:
-        (pkg_dir / "exchange.py").write_text(f'''"""
+        _write_starter(pkg_dir / "exchange.py", f'''"""
 {name} — your exchange venue (port {plan["exchange_port"]}).
 
 The matching engine, settlement, and market data are provided. You set
@@ -404,7 +441,7 @@ if __name__ == "__main__":
               "- `config.py` → your tunables", "",
               "Each class derives an `arena` base that handles all plumbing —",
               "see `from arena import Trader, Broker, Exchange`."]
-    (pkg_dir / "README.md").write_text("\n".join(lines) + "\n")
+    _write_generated(pkg_dir / "README.md", "\n".join(lines) + "\n")
 
 
 # ── Local and remote registration ─────────────────────────────────────────────
@@ -439,6 +476,31 @@ def register_local(payload: dict) -> None:
 """)
 
 
+def _http_error_detail(exc: urllib.error.HTTPError) -> str:
+    """The arena's JSON error message, or exit if the reply isn't the arena.
+
+    A proxy or firewall answers with an HTML error page — treating that as
+    an arena response once cost a student thirty wizard questions before the
+    real failure surfaced, so a non-JSON error is fatal here.
+    """
+    body = exc.read()
+    ctype = (exc.headers.get("Content-Type") or "").lower()
+    try:
+        return json.loads(body).get("error", "")
+    except Exception:
+        pass
+    if "html" in ctype or body.lstrip()[:1] == b"<":
+        sys.exit(
+            f"  ✗ Could not reach the arena: got an HTML error page "
+            f"(HTTP {exc.code}), not an arena reply.\n"
+            f"    A proxy or firewall on your network is likely blocking the "
+            f"request.\n"
+            f"    Try another network, or ask your teacher for a reachable "
+            f"arena URL."
+        )
+    return ""
+
+
 def preflight_code(url: str, code: str) -> None:
     """Check the class code against the server before the wizard walk.
 
@@ -457,10 +519,7 @@ def preflight_code(url: str, code: str) -> None:
             pass
         print("  ✓ registration code accepted\n")
     except urllib.error.HTTPError as exc:
-        try:
-            detail = json.loads(exc.read()).get("error", "")
-        except Exception:
-            detail = ""
+        detail = _http_error_detail(exc)
         if "registration code" in detail.lower() or "disabled" in detail.lower():
             sys.exit(f"  ✗ {detail}")
         print("  ✓ registration code accepted\n")   # older server, code passed
@@ -478,11 +537,17 @@ def register_remote(payload: dict, url: str, code: str) -> None:
         with urllib.request.urlopen(req, timeout=15) as resp:
             result = json.loads(resp.read())
     except urllib.error.HTTPError as exc:
-        try:
-            detail = json.loads(exc.read()).get("error", "")
-        except Exception:
-            detail = ""
-        sys.exit(f"  ✗ Registration rejected: {detail or exc}")
+        detail = _http_error_detail(exc)
+        msg = f"  ✗ Registration rejected: {detail or exc}"
+        if "already exists" in detail.lower():
+            msg += (
+                "\n    → If a previous attempt of yours failed mid-way, the "
+                "name may be taken by that\n      ghost registration: pick a "
+                "different name, or ask your teacher to remove the\n      old "
+                "entry (teacher: python -m teacher.registration remove "
+                "'<team name>')."
+            )
+        sys.exit(msg)
     except OSError as exc:
         sys.exit(f"  ✗ Could not reach {url}: {exc}")
 
@@ -509,9 +574,8 @@ def register_remote(payload: dict, url: str, code: str) -> None:
 
   Credentials:  .env               ← your secret token; never commit it
   Your code:    team/              ← write your strategy here
-  Connect:      set the env vars from .env, then e.g.
-                TEAM_ID={(result["trader_ids"] or result["broker_ids"] or ["<bot>"])[0]} \\
-                    ARENA_TOKEN=... EXCHANGE_HOST={host} python -m team.trader
+  Connect:      bots load .env automatically — just pick the seat:
+                TEAM_ID={(result["trader_ids"] or result["broker_ids"] or ["<bot>"])[0]} python -m team.trader
 """)
     if result.get("exchange_port"):
         print(f"  Your exchange is assigned port {result['exchange_port']} — "

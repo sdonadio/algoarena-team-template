@@ -867,10 +867,13 @@ def _print_startup() -> None:
     _console.print(
         f"[bold cyan]║[/bold cyan]  Exchange: {config.EXCHANGE_URL:<34}[bold cyan]║[/bold cyan]"
     )
+    # Cash is deliberately not printed here: the exchange grants each bot its
+    # registered allocation at connect (the local STARTING_CASH is only a
+    # fallback), and printing the wrong number confused every first-timer.
     _console.print(
-        f"[bold cyan]║[/bold cyan]  Cash:     ${config.STARTING_CASH:>10,.0f}"
+        f"[bold cyan]║[/bold cyan]  Cash:     set at connect"
         f"  Tick: {config.TICK_INTERVAL_SEC:.1f}s"
-        f"{'':>15}[bold cyan]║[/bold cyan]"
+        f"{'':>8}[bold cyan]║[/bold cyan]"
     )
     _console.print("[bold cyan]╚══════════════════════════════════════════════╝[/bold cyan]")
     _console.print()

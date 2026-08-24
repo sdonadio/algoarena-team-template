@@ -549,7 +549,17 @@ class BrokerBot:
             await asyncio.sleep(config.REQUOTE_INTERVAL_SEC)
             if not self._session_open:
                 continue
+            # Stagger the INITIAL book: open at most QUOTE_BURST_SYMBOLS
+            # not-yet-quoted symbols per pass, or a fresh connect fires the
+            # full ladder for every symbol in one tick and eats the venue's
+            # message quota (RATE_LIMITED on the very first look).
+            fresh_budget = config.QUOTE_BURST_SYMBOLS
             for sym in list(self._quote_symbols):
+                fresh = sym not in self.state.last_quote_prices
+                if fresh:
+                    if fresh_budget <= 0:
+                        continue            # next pass, 0.5s away
+                    fresh_budget -= 1
                 try:
                     await self.quote_symbol(sym)
                 except Exception:

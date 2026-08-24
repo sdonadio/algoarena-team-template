@@ -9,6 +9,10 @@ Environment variables:
 
 import os
 
+from shared.envfile import load_env
+
+load_env()  # .env from `make register` — shell variables still win
+
 TEAM_ID = os.environ.get("TEAM_ID", "broker_alpha")
 # EXCHANGE_URL: full URL override, e.g. wss://feed.arena.example.edu
 # (TLS-hosted play); otherwise built from EXCHANGE_HOST/EXCHANGE_PORT.
@@ -47,6 +51,14 @@ QUOTE_SIZE = 10         # shares at the touch — big enough to survive several 
 # makes book-imbalance signals readable and market orders walk the ladder.
 QUOTE_LEVELS = int(os.environ.get("QUOTE_LEVELS", "3"))
 REQUOTE_INTERVAL_SEC = 0.5  # how often to refresh quotes (seconds)
+
+# How many NOT-yet-quoted symbols to open per requote pass. Joining a live
+# 10-symbol session used to fire the full ladder for every symbol at once
+# (10 × 2 × QUOTE_LEVELS messages in one tick) — instant RATE_LIMITED spam
+# on venues with a message quota. Staggering the initial book over a few
+# passes stays comfortably under the quota; symbols already quoted are
+# unaffected (needs_requote gates those).
+QUOTE_BURST_SYMBOLS = int(os.environ.get("QUOTE_BURST_SYMBOLS", "2"))
 
 # Seconds for the quote centre to close half the gap to the external (Yahoo)
 # reference. Slow on purpose: Yahoo is a 5-second poll of a different market,

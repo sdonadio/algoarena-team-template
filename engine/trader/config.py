@@ -10,6 +10,10 @@ Environment variables:
 
 import os
 
+from shared.envfile import load_env
+
+load_env()  # .env from `make register` — shell variables still win
+
 TEAM_ID = os.environ.get("TEAM_ID", "trader_alpha")
 EXCHANGE_URL = os.environ.get("EXCHANGE_URL") or (
     f"ws://{os.environ.get('EXCHANGE_HOST', 'localhost')}"

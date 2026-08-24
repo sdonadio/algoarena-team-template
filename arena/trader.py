@@ -129,3 +129,97 @@ class _AdaptedTraderBot(TraderBot):
                         quantity=int(qty), max_price=float(px)))
         if msg.event not in ("SESSION_OPEN", "SESSION_CLOSED"):
             self._owner.on_event(msg.event, msg.message, msg.data or {})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Offline bridge: run an arena Trader inside the simulator
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _SimMarketView:
+    """Duck-typed MarketData over one signal_fn call's arguments.
+
+    Exposes the same read surface on_tick() is documented against —
+    symbols() / mid_price() / best_bid() / best_ask() / spread() /
+    prices() — built from the sim's (prices, history, book) for the symbol
+    currently being asked about. History is only known for that symbol;
+    prices(other) returns just the current level.
+    """
+
+    def __init__(self, symbol: str, ref_prices: dict, history: list, book) -> None:
+        self._symbol = symbol
+        self._ref = ref_prices
+        self._history = history
+        self._book = book
+
+    def symbols(self) -> list[str]:
+        return list(self._ref)
+
+    def mid_price(self, symbol: str) -> float | None:
+        return self._ref.get(symbol)
+
+    def prices(self, symbol: str) -> list[float]:
+        if symbol == self._symbol:
+            return list(self._history)
+        px = self._ref.get(symbol)
+        return [px] if px is not None else []
+
+    def _touch(self, side: str) -> float | None:
+        book = self._book
+        if book is None:
+            return None
+        fn = getattr(book, f"best_{side}", None)
+        if callable(fn):
+            try:
+                out = fn()
+                return getattr(out, "price", out)
+            except Exception:
+                return None
+        return None
+
+    def best_bid(self, symbol: str) -> float | None:
+        return self._touch("bid") if symbol == self._symbol else None
+
+    def best_ask(self, symbol: str) -> float | None:
+        return self._touch("ask") if symbol == self._symbol else None
+
+    def spread(self, symbol: str) -> float | None:
+        bid, ask = self.best_bid(symbol), self.best_ask(symbol)
+        return (ask - bid) if bid is not None and ask is not None else None
+
+
+class _SimPortfolioView:
+    """Duck-typed Portfolio over the sim's portfolio dict."""
+
+    def __init__(self, portfolio: dict) -> None:
+        self.cash = portfolio.get("cash", 0.0)
+        self.positions = dict(portfolio.get("positions") or {})
+        self.realized_pnl = portfolio.get("realized_pnl", 0.0)
+        self.total_fees_paid = portfolio.get("total_fees_paid", 0.0)
+        self._net_worth = portfolio.get("net_worth", self.cash)
+
+    def net_worth(self, _prices: dict | None = None) -> float:
+        return self._net_worth
+
+
+def as_signal_fn(trader: "Trader"):
+    """Wrap an arena Trader so the simulator can run it.
+
+    The simulator (make sim / tests/sim_session.py, plugin registry) speaks
+        signal_fn(symbol, prices, history, book, portfolio) -> Signal | None
+    while a Trader speaks on_tick(market, portfolio). This returns the former
+    from the latter, so one strategy runs live AND offline:
+
+        from arena import as_signal_fn
+        from team.trader import MyTrader
+        SimulatedTrader(exchange, "me", as_signal_fn(MyTrader()))
+
+    Caveat: the sim calls signal_fn once per symbol per tick; a Trader that
+    counts on_tick() invocations to measure time should count distinct
+    ticks (e.g. by len(market.prices(symbol))) instead.
+    """
+
+    def signal_fn(symbol, prices, history, book, portfolio):
+        market = _SimMarketView(symbol, prices, history, book)
+        return trader.on_tick(market, _SimPortfolioView(portfolio))
+
+    return signal_fn

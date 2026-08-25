@@ -38,8 +38,10 @@ EQUITY_SYMBOLS: list[str] = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL", "M
 # Yahoo Finance poll interval in seconds (yfinance has no WebSocket feed).
 YAHOO_POLL_INTERVAL: float = float(os.environ.get("YAHOO_POLL_INTERVAL", "5"))
 
-# Level 1: fixed $ spread posted around the mid price.
-BASE_SPREAD = 0.30      # e.g. bid = mid - 0.15, ask = mid + 0.15
+# Level 1: fixed $ spread posted around the mid price. Env-tunable so a
+# deployment can make the HOUSE market maker quote a deliberately wide market
+# (motivating student desks to provide tighter liquidity and win the flow).
+BASE_SPREAD = float(os.environ.get("BASE_SPREAD", "0.30"))  # bid=mid-half, ask=mid+half
 # …but never wider than this fraction of the price. A flat dollar spread is
 # 14 bps of a $220 share and 136 bps of a $22 one; the cap keeps the quoted
 # market realistic across a 30x price range. Floor keeps it above the tick.

@@ -107,7 +107,16 @@ def score_equity(equity: Sequence[float],
         mean_excess = sum(excess) / len(excess)
         ratio = mean_excess / max(vol, VOL_FLOOR)
         ratio = max(-RISK_ADJUSTED_CAP, min(RISK_ADJUSTED_CAP, ratio))
-        risk_adjusted = ratio * max(0.0, 1.0 - pen * mdd)
+        # Drawdown must ALWAYS hurt (balance fix): a POSITIVE ratio shrinks
+        # toward 0 (a good return earned through a big drawdown counts for
+        # less), a NEGATIVE ratio deepens (a loss with a big drawdown counts
+        # for worse). Multiplying a negative ratio by (1 - pen*mdd) < 1 would
+        # pull it toward zero — which let the most-levered, biggest-drawdown
+        # loser rank HIGHEST. So penalize by sign.
+        if ratio >= 0:
+            risk_adjusted = ratio * max(0.0, 1.0 - pen * mdd)
+        else:
+            risk_adjusted = ratio * (1.0 + pen * mdd)
     else:
         risk_adjusted = 0.0
 

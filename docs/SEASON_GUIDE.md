@@ -133,9 +133,9 @@ enable something the engine does not otherwise support.
 | Week | Label | Unlocks |
 |------|-------|---------|
 | 1 | Paper trading — nothing counts | long-only, limit/market only, limit 200, **not scored** |
-| 2 | Season starts | short selling, scoring begins, limit 400 |
-| 3 | Signals & earnings season | earnings calendar, dividends, **the ORCA IPO**, limit 600 |
-| 4 | Market making | post-only, opening auction, **purchase window 1**, limit 800 |
+| 2 | Season scoring begins | scoring on, **long-only** (learn async first), one earnings print, limit 400 |
+| 3 | Signals & earnings | earnings calendar, still **long-only** (protocol focus), limit 600 |
+| 4 | The market gets real | **short selling** + borrow desk, post-only, opening auction, **the ORCA IPO**, **purchase window 1**, limit 800 |
 | 5 | Risk | circuit breakers + liquidation drama (maintenance 0.5) |
 | 6 | Scenario tournament | limit 1000, dense calendar + **the VLTA IPO** — the ten assessed scenarios run this session (MIDTERM_SCENARIOS.md); the closed-book MCQ midterm is the same week |
 | 7 | Execution | rate quotas, cancellation fees, latency tiers, **purchase window 2** |

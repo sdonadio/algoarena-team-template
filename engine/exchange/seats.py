@@ -441,5 +441,10 @@ def roster_entry(plan: dict, module_prefix: str | None = None) -> dict:
     entry["traders"] = plan["trader_ids"]
     if plan["trader_ids"] and module_prefix:
         entry["trader_module"] = f"{module_prefix}.trader"
-    entry["capital"] = plan["capital"]
+    entry["capital"] = dict(plan["capital"])
+    # The exchange seat is not a trading account: pin its capital to 0 so it
+    # can never draw the INITIAL_CASH fallback in starting_cash_for and connect
+    # as an unbudgeted $100k trader (audit H5).
+    if plan["exchange_port"]:
+        entry["capital"].setdefault(f"{plan['slug']}_exchange", 0)
     return entry

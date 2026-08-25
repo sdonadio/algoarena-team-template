@@ -232,3 +232,81 @@ def test_cancel_team_orders():
     book.place_order("m2", "buy", 97.0, 10)
     assert book.cancel_team_orders("m1") == 2
     assert book.best_bid() == 97.0
+
+
+# ── Zero-capital seats are liquidatable (audit H4) ────────────────────────────
+
+def test_zero_capital_seat_is_liquidated_when_underwater(server):
+    # A $0-allocated seat used to be exempt from the maintenance sweep, so it
+    # could short with unlimited downside forever. Now its threshold is 0, so
+    # it liquidates once net worth goes negative.
+    p, _ = add_team(server, "kamikaze", cash=0.0)
+    assert p.starting_cash == 0.0
+    p.positions["AAPL"] = -100          # short
+    p.avg_cost["AAPL"] = 100.0
+    p.cash = 10_000.0                    # got 10k from the short sale
+    server.ref_prices["AAPL"] = 205.0    # short is deep underwater → nw < 0
+    run(server._apply_carry_and_maintenance())
+    assert p.liquidated is True
+
+
+def test_zero_capital_seat_flat_is_not_liquidated(server):
+    p, _ = add_team(server, "idle", cash=0.0)
+    run(server._apply_carry_and_maintenance())
+    assert p.liquidated is False
+
+
+# ── Market-wide halt must not freeze the tick loop (audit H3) ──────────────────
+
+def test_market_halt_does_not_block_the_clock(server, monkeypatch):
+    import exchange.config as cfg
+    # If the halt still slept inline, HALT_DURATION_SEC=3600 would hang the
+    # event loop for an hour and this test would time out.
+    monkeypatch.setattr(cfg, "HALT_DURATION_SEC", 3600)
+
+    async def scenario():
+        await server._halt_all_symbols("stress", level=1)   # must return at once
+        assert server.circuit_breaker.market_halted is True
+        # The clock keeps running WHILE halted: an underwater zero-capital seat
+        # still gets liquidated instead of freezing the game.
+        p, _ = add_team(server, "kamikaze", cash=0.0)
+        p.positions["AAPL"] = -100
+        p.avg_cost["AAPL"] = 100.0
+        p.cash = 10_000.0
+        server.ref_prices["AAPL"] = 205.0
+        await server._apply_carry_and_maintenance()
+        assert p.liquidated is True
+        for t in list(server._bg_tasks):                    # tidy the resume task
+            t.cancel()
+
+    run(scenario())
+
+
+# ── Position limit is open-order-aware and team-scoped (audit H2) ─────────────
+
+def test_position_limit_counts_resting_orders(server):
+    # Limit 100. Rest 60 (no crossing seller → it rests), then try 60 more:
+    # the resting order must count, so the second is refused.
+    p, ws = add_team(server, "t1")
+    place(server, ws, "t1", side="buy", qty=60, price=100.0)   # rests
+    assert last_error(ws) is None
+    place(server, ws, "t1", side="buy", qty=60, price=100.0)   # 60+60 > 100
+    assert last_error(ws) == "POSITION_LIMIT"
+
+
+def test_position_limit_is_team_scoped(server, monkeypatch, tmp_path):
+    import json
+    # Two bots, one team: their aggregate exposure shares the ±100 cap, so a
+    # team can't get N× headroom by splitting across seats.
+    roster = tmp_path / "teams.json"
+    roster.write_text(json.dumps({
+        "Firm": {"traders": ["firm_t1", "firm_t2"],
+                 "capital": {"firm_t1": 100000, "firm_t2": 100000}},
+    }))
+    monkeypatch.setattr(config, "ROSTER_PATH", str(roster))
+    config._roster_cache["key"] = None
+    p1, ws1 = add_team(server, "firm_t1")
+    p2, ws2 = add_team(server, "firm_t2")
+    p1.positions["AAPL"] = 60                       # teammate already long 60
+    place(server, ws2, "firm_t2", side="buy", qty=60, price=100.0)  # 60+60>100
+    assert last_error(ws2) == "POSITION_LIMIT"

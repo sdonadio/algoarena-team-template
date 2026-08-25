@@ -507,16 +507,32 @@ class ExchangeServer:
                 # Market-data only: no portfolio, no grant, no scoring row, and
                 # a namespaced id (above) so it can never take over a real seat.
                 logger.info("Observer connected: %s", team_id)
-            elif team_id not in self.portfolios:
-                new_portfolio = True
-                self.portfolios[team_id] = Portfolio(
-                    team_id=team_id, role=msg.role, level=msg.level,
-                    cash=config.funded_cash_for(team_id),
-                )
-                logger.info(
-                    "Joined: %-20s  role=%-8s  level=%d",
-                    team_id, msg.role, msg.level,
-                )
+            else:
+                # Role comes from the ROSTER, not the handshake (audit H7): a
+                # trader cannot claim "broker" for margin, or pick the emptier
+                # ranking league. The exchange seat runs its own venue process,
+                # not a trading portfolio, so refuse it here.
+                roster_role = config.role_for_bot(team_id)
+                if roster_role == "exchange":
+                    await self._send(websocket, ErrorMsg(
+                        code="FORBIDDEN",
+                        message=(f"{team_id} is an exchange seat, not a trading "
+                                 "account — run it with `make exchange`")))
+                    return
+                role = roster_role or msg.role
+                if roster_role and roster_role != msg.role:
+                    logger.warning("Role override for %s: claimed %s, roster %s",
+                                   team_id, msg.role, roster_role)
+                if team_id not in self.portfolios:
+                    new_portfolio = True
+                    self.portfolios[team_id] = Portfolio(
+                        team_id=team_id, role=role, level=msg.level,
+                        cash=config.funded_cash_for(team_id),
+                    )
+                    logger.info(
+                        "Joined: %-20s  role=%-8s  level=%d",
+                        team_id, role, msg.level,
+                    )
 
             # Send current book state so client can build a local picture.
             for symbol, book in self.books.items():
@@ -542,7 +558,7 @@ class ExchangeServer:
                     # First appearance mid-session: give the same starting
                     # grant everyone else got at the open. Reconnects reuse
                     # the existing portfolio, so this can never double-grant.
-                    n = config.STARTING_SHARES_PER_SYMBOL
+                    n = config.starting_shares_for_bot(team_id)   # per-team divided (H1)
                     portfolio = self.portfolios[team_id]
                     if n > 0:
                         for sym in self.books:
@@ -775,15 +791,30 @@ class ExchangeServer:
             ))
             return
 
-        # Per-symbol position limit (worst case: full fill of this order).
+        # Per-symbol position limit — enforced at TEAM scope and counting
+        # RESTING orders (audit H2). Otherwise a team split the same risk
+        # across N seats (N× the cap) and one bot rested N sub-limit orders
+        # that all filled through the cap. Worst case: every same-side resting
+        # order for the team fills, plus this order.
         limit = self.position_limit_for(team_id)
         if limit > 0:
-            if abs(worst_pos) > limit:
+            tkey = config.team_of(team_id) or team_id
+            key_fn = lambda t: config.team_of(t) or t
+            team_pos = sum(
+                p.positions.get(msg.symbol, 0)
+                for tid, p in self.portfolios.items()
+                if (config.team_of(tid) or tid) == tkey)
+            book = self.books.get(msg.symbol)
+            open_buys = book.open_quantity(tkey, "buy", key_fn) if book else 0
+            open_sells = book.open_quantity(tkey, "sell", key_fn) if book else 0
+            worst_team = (team_pos + open_buys + msg.quantity if msg.side == "buy"
+                          else team_pos - open_sells - msg.quantity)
+            if abs(worst_team) > limit:
                 await self._reject(ws, team_id, ErrorMsg(
                     code="POSITION_LIMIT",
                     message=(
-                        f"Order would take {msg.symbol} position to {worst_pos:+d} "
-                        f"(limit ±{limit})"
+                        f"Order would take your team's {msg.symbol} exposure to "
+                        f"{worst_team:+d} counting resting orders (limit ±{limit})"
                     ),
                 ))
                 return
@@ -1360,7 +1391,7 @@ class ExchangeServer:
                 team_id=msg.bot_id, role=role, level=1,
                 cash=config.funded_cash_for(msg.bot_id))
             self.portfolios[msg.bot_id] = portfolio
-            n = config.STARTING_SHARES_PER_SYMBOL
+            n = config.starting_shares_for_bot(msg.bot_id)   # per-team divided (H1)
             if self.session_open and self._session_granted and n > 0:
                 for sym in self.books:
                     if not config.is_future(sym):
@@ -2120,7 +2151,10 @@ class ExchangeServer:
             # (audit C4): a 1-share self-quote could otherwise inflate marked
             # net worth and dodge the maintenance check.
             for p in list(self.portfolios.values()):
-                if p.role == "observer" or p.liquidated or p.starting_cash <= 0:
+                # A zero-capital seat is NOT exempt (audit H4): its maintenance
+                # threshold is just 0, so it liquidates only once net worth goes
+                # negative — but it can no longer short with impunity forever.
+                if p.role == "observer" or p.liquidated:
                     continue
                 nw = p.net_worth(self.ref_prices)
                 if nw >= p.starting_cash * config.MAINTENANCE_FRACTION:
@@ -2140,15 +2174,21 @@ class ExchangeServer:
         return float(config.config_for_team(team_id, "order_quota"))
 
     def _take_quota(self, team_id: str, n: float = 1.0) -> bool:
-        """Consume one message of quota. True if the bot was within it."""
+        """Consume one message of quota. True if within it.
+
+        Metered at TEAM scope (audit H2): a team's bots share one message
+        budget, so buying more seats does not multiply the venue's message
+        allowance. Keyed by the roster team when known.
+        """
         quota = self.quota_for(team_id)
         if quota <= 0:
             return True
-        bucket = self.quotas.get(team_id)
+        key = config.team_of(team_id) or team_id
+        bucket = self.quotas.get(key)
         if bucket is None or bucket.refill != quota:
             # First message, or the quota changed (new week / quota upgrade).
             bucket = limits.bucket_for(quota)
-            self.quotas[team_id] = bucket
+            self.quotas[key] = bucket
         return bucket.take(n)
 
     def _refill_quotas(self) -> None:
@@ -2326,11 +2366,16 @@ class ExchangeServer:
         if self._session_granted:
             return
         self._session_granted = True
-        n = config.STARTING_SHARES_PER_SYMBOL
-        if n <= 0:
+        if config.STARTING_SHARES_PER_SYMBOL <= 0:
             return
+        granted = 0
         for portfolio in self.portfolios.values():
             if portfolio.role == "observer":
+                continue
+            # Grant is divided across the team's seats (audit H1), so seat
+            # count no longer multiplies free inventory.
+            n = config.starting_shares_for_bot(portfolio.team_id)
+            if n <= 0:
                 continue
             for sym in self.books:
                 # Futures are contracts, not shares — nothing to grant.
@@ -2339,11 +2384,14 @@ class ExchangeServer:
                 portfolio.positions[sym] = portfolio.positions.get(sym, 0) + n
                 if sym not in portfolio.avg_cost:
                     portfolio.avg_cost[sym] = self.ref_prices.get(sym, 0.0)
+                # NOT ledgered in midsession_grants: the open grant precedes
+                # _capture_sod, so start-of-day positions already include it.
+            granted += 1
             ws = self.clients.get(portfolio.team_id)
             if ws:
                 await self._send(ws, portfolio.to_message(self.ref_prices))
-        logger.info("Starting shares distributed: %d per symbol to %d participants",
-                    n, len(self.portfolios))
+        logger.info("Starting shares distributed (per-team divided) to %d participants",
+                    granted)
 
     async def _run_opening_cross(self) -> None:
         """Cross every book at its clearing price, then open the market."""
@@ -3439,6 +3487,15 @@ class ExchangeServer:
             message=f"Market-wide Level {level} halt: {reason}",
             data={"level": level, "reason": reason, "duration": duration},
         ))
+        # Resume from a BACKGROUND task, never inline (audit H3): this method
+        # is awaited from advance_tick, so sleeping here froze the entire tick
+        # loop for the halt duration — no maintenance, no liquidation, no
+        # snapshots — letting a losing team stop the clock to dodge a margin
+        # call. Spawning keeps the clock running while trading is halted.
+        self._spawn(self._resume_market(level, duration))
+
+    async def _resume_market(self, level: int, duration: float) -> None:
+        """Lift a market-wide halt after `duration` (runs off the tick loop)."""
         await asyncio.sleep(duration)
         self.circuit_breaker.market_halted = False
         await self._broadcast(SessionEvent(

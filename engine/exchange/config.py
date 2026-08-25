@@ -242,6 +242,35 @@ def starting_cash_for(team_id: str) -> float:
     return INITIAL_CASH
 
 
+def starting_shares_for_bot(bot_id: str) -> int:
+    """Per-symbol starting-share grant for one bot, DIVIDED across its team's
+    seats (audit H1). The old grant was STARTING_SHARES_PER_SYMBOL per bot, so
+    a 7-seat team started with 7x the free inventory of a 1-seat team; now a
+    team's total is ~STARTING_SHARES_PER_SYMBOL per symbol however many seats
+    it bought. A bot with no roster team (local play) gets the full amount.
+    """
+    n = STARTING_SHARES_PER_SYMBOL
+    if n <= 0:
+        return 0
+    for cfg in _read_roster().values():
+        if bot_id in roster_shape.bot_ids_of(cfg) \
+                or bot_id in (cfg.get("capital") or {}):
+            seats = len(roster_shape.bot_ids_of(cfg, include_exchange=False)) or 1
+            return n // seats
+    return n
+
+
+def role_for_bot(bot_id: str) -> str | None:
+    """The declared seat role of a bot id across the roster, or None if the
+    bot is not a declared seat anywhere (audit H7 — role must come from the
+    roster, not the handshake)."""
+    for cfg in _read_roster().values():
+        role = roster_shape.role_of(cfg, bot_id)
+        if role is not None:
+            return role
+    return None
+
+
 def team_of(bot_id: str) -> str | None:
     """Team name owning this bot id, via the roster.
 

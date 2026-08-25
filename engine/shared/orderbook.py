@@ -181,6 +181,18 @@ class OrderBook:
             del self._orders[oid]
         return len(ids)
 
+    def open_quantity(self, key: str, side: str, key_fn=None) -> int:
+        """Total resting quantity on `side` for orders whose team maps to `key`.
+
+        Used by the exchange's pre-trade position check so RESTING orders count
+        toward exposure — otherwise N orders each under the cap all fill through
+        it (audit H2). `key_fn` maps an order's team_id to the aggregation key
+        (defaults to the book's STP key, i.e. bot or team per STP_SCOPE).
+        """
+        kf = key_fn or self._stp_key
+        return sum(o.remaining for o in self._orders.values()
+                   if o.side == side and kf(o.team_id) == key)
+
     def get_snapshot(self, depth: int = 10) -> dict:
         """Return a depth-limited book view plus market statistics."""
         bids_by_price: dict[float, int] = {}

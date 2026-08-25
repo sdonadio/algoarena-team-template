@@ -58,6 +58,24 @@ def broker_ids_of(team_cfg: dict) -> list[str]:
     return out
 
 
+def role_of(team_cfg: dict, bot_id: str) -> str | None:
+    """The seat kind a bot id holds in one roster entry, or None.
+
+    "exchange" / "broker" / "trader". Declared seats only — a bot that
+    appears only in the capital map has no declared role. Used to reject a
+    handshake that claims a role the roster does not grant (audit H7).
+    """
+    if not isinstance(team_cfg, dict):
+        return None
+    if bot_id and bot_id == team_cfg.get("exchange"):
+        return "exchange"
+    if bot_id in broker_ids_of(team_cfg):
+        return "broker"
+    if bot_id in (team_cfg.get("traders") or []):
+        return "trader"
+    return None
+
+
 def bot_ids_of(team_cfg: dict, include_exchange: bool = True) -> list[str]:
     """Every bot id a roster entry declares, in display order.
 

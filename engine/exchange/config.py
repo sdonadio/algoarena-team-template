@@ -27,7 +27,10 @@ TICK_SIZE = float(os.environ.get("ARENA_TICK_SIZE", "0.01"))
 # Self-trade prevention scope: "bot" (an order never matches ITS OWN resting
 # order) or "team" (never matches ANY of its roster team's orders — full
 # firm-level STP, disabling intra-team internalization).
-STP_SCOPE = os.environ.get("STP_SCOPE", "bot").lower()
+# Self-trade-prevention scope. "team" (default) blocks a team from crossing
+# its own bots — wash trading between your own seats (audit C2). "bot" only
+# blocks a bot crossing itself, which permitted intra-team wash trades.
+STP_SCOPE = os.environ.get("STP_SCOPE", "team").lower()
 
 INITIAL_CASH = 100_000.0          # starting cash for every team
 SNAPSHOT_INTERVAL_SEC = 0.5       # book-snapshot broadcast cadence
@@ -158,20 +161,37 @@ ROSTER_PATH = os.environ.get(
     os.path.join(os.path.dirname(__file__), "..", "teacher", "teams.json"),
 )
 
+_roster_cache: dict = {"key": None, "data": {}}
+
+
 def _read_roster() -> dict:
     """Parse the roster file, or {} if it is missing/unreadable.
 
-    Re-read on every call on purpose: the dashboard writes the roster while
-    the exchange is running (registrations, upgrade purchases), and the
-    exchange must see those edits without a restart.
+    Cached on the file's (mtime, size): the dashboard writes the roster while
+    the exchange runs (registrations, upgrade purchases) and the exchange must
+    see those edits without a restart, but re-reading on EVERY call made
+    team-scoped STP (config.team_of, called per matched price level) do a file
+    read per level. The mtime key gives both: fresh on write, cheap otherwise.
     """
+    import json
     try:
-        import json
+        st = os.stat(ROSTER_PATH)
+        key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        _roster_cache["key"] = None
+        _roster_cache["data"] = {}
+        return {}
+    if key == _roster_cache["key"]:
+        return _roster_cache["data"]
+    try:
         with open(ROSTER_PATH) as f:
             roster = json.load(f)
-        return roster if isinstance(roster, dict) else {}
+        data = roster if isinstance(roster, dict) else {}
     except (OSError, ValueError):
-        return {}
+        data = {}
+    _roster_cache["key"] = key
+    _roster_cache["data"] = data
+    return data
 
 
 # What fraction of a bot's allocation a STUDENT venue funds. The roster

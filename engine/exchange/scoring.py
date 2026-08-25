@@ -15,13 +15,22 @@ where scoring_counts is true):
     peak[i]           = max(e[0..i])
     max_drawdown      = max over i of (peak[i] - e[i]) / peak[i]
 
-    risk_adjusted     = (mean_return / vol) * max(0, 1 - PENALTY * max_drawdown)
+    excess[i]         = r[i] - RISK_FREE_PER_SNAPSHOT      # return above idle cash
+    risk_adjusted     = (mean(excess) / max(vol, VOL_FLOOR))
+                        * max(0, 1 - PENALTY * max_drawdown)
+                        clamped to +/- RISK_ADJUSTED_CAP
 
-with PENALTY = SEASON_DRAWDOWN_PENALTY (default 2.0). vol == 0 (a team that
-never traded) scores 0 — you cannot win the season by standing still.
+with PENALTY = SEASON_DRAWDOWN_PENALTY (default 2.0).
 
-The multiplier is floored at zero so a catastrophic drawdown cannot flip a
-negative Sharpe into a positive score.
+Why excess return and a vol floor (audit C1): idle cash earns
+CASH_INTEREST_PER_TICK every tick, so a do-nothing all-cash book has a
+tiny-but-nonzero return and a volatility of pure floating-point noise
+(~1e-16). The old formula divided the drift by that noise and scored idle
+cash ~1e9x a real trader — "standing still" was the dominant strategy, the
+exact opposite of the intent. Scoring the return ABOVE the risk-free drift
+makes idle cash score ~0; flooring the denominator stops a near-constant
+book from exploding; the cap bounds any residual. A catastrophic drawdown
+still cannot flip a negative score positive (the multiplier floors at 0).
 """
 
 from __future__ import annotations
@@ -35,6 +44,21 @@ SEASON_DRAWDOWN_PENALTY = float(os.environ.get("SEASON_DRAWDOWN_PENALTY", "2.0")
 
 # Minimum snapshots before a score is meaningful.
 MIN_SNAPSHOTS = 3
+
+# Risk-free drift per equity snapshot: idle cash compounds at
+# CASH_INTEREST_PER_TICK for SEASON_SNAPSHOT_TICKS ticks between snapshots.
+# Returns are scored net of this, so parking cash is worth ~0, not a fortune.
+_CASH_INTEREST_PER_TICK = float(os.environ.get("CASH_INTEREST_PER_TICK", "0.000002"))
+_SNAPSHOT_TICKS = int(os.environ.get("SEASON_SNAPSHOT_TICKS", "60"))
+RISK_FREE_PER_SNAPSHOT = (1.0 + _CASH_INTEREST_PER_TICK) ** _SNAPSHOT_TICKS - 1.0
+
+# Denominator floor: one snapshot of the risk-free rate. Prevents a
+# near-constant equity curve (vol ~ float noise) from producing an
+# astronomical ratio.
+VOL_FLOOR = float(os.environ.get("SCORE_VOL_FLOOR", str(max(RISK_FREE_PER_SNAPSHOT, 1e-4))))
+
+# Hard bound on the risk-adjusted score, so no residual edge case explodes.
+RISK_ADJUSTED_CAP = float(os.environ.get("SCORE_RISK_ADJUSTED_CAP", "10.0"))
 
 
 def returns(equity: Sequence[float]) -> list[float]:
@@ -75,8 +99,15 @@ def score_equity(equity: Sequence[float],
     mean_r = (sum(r) / len(r)) if r else 0.0
     mdd = max_drawdown(eq)
 
-    if vol > 0 and n >= MIN_SNAPSHOTS:
-        risk_adjusted = (mean_r / vol) * max(0.0, 1.0 - pen * mdd)
+    # Score the return ABOVE the risk-free drift, over a floored denominator,
+    # then clamp. This is what stops "park cash and do nothing" from winning
+    # the season (audit C1).
+    if n >= MIN_SNAPSHOTS and r:
+        excess = [x - RISK_FREE_PER_SNAPSHOT for x in r]
+        mean_excess = sum(excess) / len(excess)
+        ratio = mean_excess / max(vol, VOL_FLOOR)
+        ratio = max(-RISK_ADJUSTED_CAP, min(RISK_ADJUSTED_CAP, ratio))
+        risk_adjusted = ratio * max(0.0, 1.0 - pen * mdd)
     else:
         risk_adjusted = 0.0
 

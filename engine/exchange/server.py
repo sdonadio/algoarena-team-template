@@ -392,6 +392,12 @@ class ExchangeServer:
 
         # team_ids that authenticated as role="teacher"; allowed to send TeacherCommand.
         self.teacher_clients: set[str] = set()
+        # Teacher privilege is keyed on the SOCKET, not the claimed team_id
+        # string (audit C7): an observer could otherwise claim the dashboard's
+        # id and inherit its powers. teacher_clients stays for broadcast
+        # targeting; teacher_ws is the authorization gate.
+        self.teacher_ws: set[Any] = set()
+        self._observer_seq: int = 0
 
         # Per-team message quota buckets (order + cancel traffic).
         self.quotas: dict[str, limits.TokenBucket] = {}
@@ -478,7 +484,15 @@ class ExchangeServer:
                 logger.warning("Auth failed: %s (role=%s)", msg.team_id, msg.role)
                 return
 
-            team_id = msg.team_id
+            # Observers are admitted with any valid token (market-data access),
+            # so their claimed team_id is untrusted — give them a unique,
+            # non-colliding id so one can never occupy a real bot's or the
+            # teacher's routing slot (audit C7: account takeover / escalation).
+            if msg.role == "observer":
+                self._observer_seq += 1
+                team_id = f"observer:{self._observer_seq}"
+            else:
+                team_id = msg.team_id
             if team_id in self.clients:
                 logger.info("Reconnect: %s", team_id)
             self.clients[team_id] = websocket
@@ -487,7 +501,12 @@ class ExchangeServer:
             new_portfolio = False
             if msg.role == "teacher":
                 self.teacher_clients.add(team_id)
+                self.teacher_ws.add(websocket)
                 logger.info("Teacher connected: %s", team_id)
+            elif msg.role == "observer":
+                # Market-data only: no portfolio, no grant, no scoring row, and
+                # a namespaced id (above) so it can never take over a real seat.
+                logger.info("Observer connected: %s", team_id)
             elif team_id not in self.portfolios:
                 new_portfolio = True
                 self.portfolios[team_id] = Portfolio(
@@ -603,7 +622,11 @@ class ExchangeServer:
         except Exception:
             logger.exception("Unhandled error for client %s", team_id or "unknown")
         finally:
-            if team_id:
+            # Remove only what THIS socket owns (audit C7): popping by name let
+            # any client evict the real dashboard by connecting+disconnecting
+            # under its id.
+            self.teacher_ws.discard(websocket)
+            if team_id and self.clients.get(team_id) is websocket:
                 self.clients.pop(team_id, None)
                 self.teacher_clients.discard(team_id)
             self.ws_to_team.pop(websocket, None)
@@ -782,8 +805,11 @@ class ExchangeServer:
                 ))
                 return
         elif msg.side == "buy":
+            # MOC ignores its price field and fills at the closing cross, so
+            # fund it at the mark like a market order — otherwise price=0
+            # defeats the buying-power check entirely (audit C6).
             ref = (
-                msg.price if msg.order_type != "market"
+                msg.price if msg.order_type not in ("market", "moc")
                 else self.ref_prices.get(msg.symbol, msg.price)
             )
             worst_fee = (config.config_for_team(team_id, "taker_fee")
@@ -1087,7 +1113,7 @@ class ExchangeServer:
         self, ws: Any, msg: TeacherCommand, team_id: str
     ) -> None:
         """Execute a remote teacher command sent by shock_tool or other tool."""
-        if team_id not in self.teacher_clients:
+        if ws not in self.teacher_ws:
             await self._send(ws, ErrorMsg(
                 code="FORBIDDEN", message="Only teacher-role connections may send TeacherCommand",
             ))
@@ -1182,7 +1208,7 @@ class ExchangeServer:
         relay connection. The exchange still re-validates everything except
         identity, because it is the only component that can see live cash.
         """
-        if team_id not in self.teacher_clients:
+        if ws not in self.teacher_ws:
             await self._send(ws, ErrorMsg(
                 code="FORBIDDEN",
                 message=("Upgrade purchases must be submitted through the "
@@ -1306,7 +1332,7 @@ class ExchangeServer:
         order path as that bot — every guard (band, SSR, halts, cash,
         quota) applies exactly as it would to the bot's own order.
         """
-        if team_id not in self.teacher_clients:
+        if ws not in self.teacher_ws:
             await self._send(ws, ErrorMsg(
                 code="FORBIDDEN",
                 message="Manual orders must come through the team portal",
@@ -1380,7 +1406,7 @@ class ExchangeServer:
         student's team token over HTTP and forwards the request on its relay
         connection; the exchange re-validates everything except identity.
         """
-        if team_id not in self.teacher_clients:
+        if ws not in self.teacher_ws:
             await self._send(ws, ErrorMsg(
                 code="FORBIDDEN",
                 message="Seat purchases must be submitted through the portal",
@@ -1515,6 +1541,17 @@ class ExchangeServer:
                 notional * config.config_for_team(taker_id, "taker_fee"), 8)
             rebate = round(
                 notional * config.config_for_team(maker_id, "maker_rebate"), 8)
+            # The venue must never pay out more than it collected on a print
+            # (audit C5): the fee_tier upgrade resolves taker and maker rates
+            # independently and could invert rebate > taker, minting cash. Cap
+            # the rebate so the venue keeps at least VENUE_NET_MIN_BPS, and pay
+            # NO rebate when maker and taker are the same team (self-dealing).
+            max_rebate = max(0.0, taker_fee
+                             - notional * config.VENUE_NET_MIN_BPS / 10_000.0)
+            rebate = min(rebate, max_rebate)
+            if config.team_of(maker_id) is not None \
+                    and config.team_of(maker_id) == config.team_of(taker_id):
+                rebate = 0.0
             if trade.aggressor == "buy":     # buyer crossed the spread
                 buyer_fee, buyer_rebate  = taker_fee, 0.0
                 seller_fee, seller_rebate = 0.0, rebate
@@ -2079,11 +2116,13 @@ class ExchangeServer:
 
         # Maintenance check: force-liquidate teams below the threshold.
         if config.LIQUIDATION_ENABLED:
-            bidask = self._bidask_marks()
+            # Mark at the venue reference, NOT the team's own resting bid/ask
+            # (audit C4): a 1-share self-quote could otherwise inflate marked
+            # net worth and dodge the maintenance check.
             for p in list(self.portfolios.values()):
                 if p.role == "observer" or p.liquidated or p.starting_cash <= 0:
                     continue
-                nw = p.net_worth(self.ref_prices, bidask)
+                nw = p.net_worth(self.ref_prices)
                 if nw >= p.starting_cash * config.MAINTENANCE_FRACTION:
                     continue
                 if self.tick < p.shield_until_tick:
@@ -2830,7 +2869,7 @@ class ExchangeServer:
     ) -> None:
         """An indication of interest — from a bot or the portal relay."""
         bot = msg.team_id
-        if team_id in self.teacher_clients:
+        if ws in self.teacher_ws:
             # Portal path: the dashboard verified the team token; the
             # exchange re-validates that the bot belongs to that team.
             if bot not in upgrades.team_bots(msg.team):
@@ -2851,8 +2890,26 @@ class ExchangeServer:
             ok, detail = False, f"no IPO for {msg.symbol!r}"
         else:
             px = msg.max_price if msg.max_price > 0 else deal.range_hi
-            ok, detail = deal.subscribe(bot, msg.quantity, px)
-        if team_id in self.teacher_clients:
+            # Size cap + collateral (audit C8). Uncapped/uncollateralized, one
+            # line of student code could bid millions to corner the pro-rata
+            # book, or bid huge with no cash to force the clearing price to the
+            # top and void the deal for everyone. Cap the indication at the
+            # offering size and require it be backed by cash (live if
+            # connected, else the bot's roster allocation).
+            cap = max(1, int(deal.shares * ipo_mod.MAX_INDICATION_FRACTION))
+            pf = self.portfolios.get(bot)
+            available = pf.cash if pf is not None else config.starting_cash_for(bot)
+            if msg.quantity > cap:
+                ok, detail = False, (
+                    f"indication of {msg.quantity} exceeds the {cap}-share "
+                    f"cap for this deal")
+            elif px * msg.quantity > available:
+                ok, detail = False, (
+                    f"indication of {msg.quantity} up to ${px:.2f} needs "
+                    f"${px * msg.quantity:,.0f} but you have ${available:,.0f}")
+            else:
+                ok, detail = deal.subscribe(bot, msg.quantity, px)
+        if ws in self.teacher_ws:
             await self._send(ws, SessionEvent(
                 event="IPO_SUB_RESULT", message=detail,
                 data={"ok": ok, "request_id": msg.request_id,
@@ -2884,16 +2941,21 @@ class ExchangeServer:
             self._pending_close_persist = persist
             for book in self.books.values():
                 book.auction_mode = True
-            # Inject held MOC orders into the closing books as always-
-            # eligible limits: an MOC takes the clearing price, whatever
-            # it is, so its limit is far beyond any plausible cross.
+            # Inject held MOC orders into the closing books as eligible limits.
+            # An MOC takes the clearing price, which by construction is inside
+            # the LULD band, so pricing the eligibility limit at the band EDGE
+            # (not ref*1.5/0.5) still crosses at the cross — but any unfilled
+            # remainder can no longer rest 50% off the mark to be picked off
+            # later (audit C6).
+            band = config.LULD_BAND_PCT if config.LULD_BAND_PCT > 0 else 0.10
             for sym, pending in self.moc_orders.items():
                 book = self.books.get(sym)
                 ref = self.ref_prices.get(sym) or 0.0
                 if book is None or ref <= 0:
                     continue
                 for entry in pending.values():
-                    px = ref * (1.5 if entry["side"] == "buy" else 0.5)
+                    px = ref * (1.0 + band if entry["side"] == "buy"
+                                else 1.0 - band)
                     book.place_order(team_id=entry["team_id"],
                                      side=entry["side"], price=px,
                                      quantity=entry["quantity"])
@@ -3126,12 +3188,14 @@ class ExchangeServer:
         if not force and (self.tick - self._last_equity_snapshot_tick) < every:
             return
         self._last_equity_snapshot_tick = self.tick
-        marks = self._bidask_marks()
         for tid, p in self.portfolios.items():
             if p.role == "observer":
                 continue
             hist = self.equity_history.setdefault(tid, [])
-            hist.append((self.tick, round(p.net_worth(self.ref_prices, marks), 4)))
+            # Score at the venue reference, NOT the team's own resting bid/ask
+            # (audit C4): marking scored equity at a 1-share self-quote let a
+            # team paint its own risk-adjusted score.
+            hist.append((self.tick, round(p.net_worth(self.ref_prices), 4)))
             if len(hist) > persistence.EQUITY_HISTORY_MAX:
                 del hist[:len(hist) - persistence.EQUITY_HISTORY_MAX]
         self._season_dirty = True

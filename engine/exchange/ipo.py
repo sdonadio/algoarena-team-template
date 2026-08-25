@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import struct
 from dataclasses import dataclass, field
 
@@ -34,6 +35,16 @@ import plugins.securities.defaults as securities
 #: Distribution of ln(true_value / offer_price). Mean +12%, wide tails.
 POP_MU = 0.12
 POP_SIGMA = 0.18
+
+#: A single indication may not exceed this fraction of the deal (audit C8):
+#: uncapped, one bot returning a huge quantity (e.g. 10,000,000 on a 4,000-
+#: share deal) swamped the pro-rata weights to corner the book, or — with no
+#: cash — forced the clearing price to the top of the range and voided the
+#: deal for everyone. 1.0 means "you cannot indicate for more shares than
+#: exist"; combined with the collateral check in the exchange handler this
+#: restores the winner's-curse trade-off. Enforced in server._handle_ipo_
+#: subscribe (not here) so allocation-math unit tests can set up freely.
+MAX_INDICATION_FRACTION = float(os.environ.get("IPO_MAX_INDICATION_FRACTION", "1.0"))
 
 
 def pop_factor(symbol: str, seed: str | None = None) -> float:

@@ -24,6 +24,8 @@ __all__ = [
     "IPOSubscribe",
     # Exchange → Client
     "OrderAck",
+    "QueueUpdate",
+    "LadderSnapshot",
     "TradeExecution",
     "BookSnapshot",
     "PortfolioUpdate",
@@ -183,6 +185,50 @@ class OrderAck(BaseModel):
     side: Literal["buy", "sell"]
     price: float
     quantity: int
+    # Queue standing at the moment the order rests (0 for fully-filled/rejected).
+    # queue_ahead = shares that will fill before this order at its price level;
+    # level_qty = total shares resting at that price+side. Defaults keep older
+    # clients and non-queue builds working unchanged.
+    queue_ahead: int = 0
+    level_qty: int = 0
+
+
+class QueueUpdate(BaseModel):
+    """Owner-only push: a resting order's FIFO queue standing changed (a fill or
+    cancel ahead of it advanced it; a reprice sent it to the back). Sent only to
+    the order's owner so a team's resting size is never leaked to competitors."""
+    type: Literal["queue_update"] = "queue_update"
+    order_id: str
+    team_id: str
+    symbol: str
+    side: Literal["buy", "sell"]
+    price: float
+    queue_ahead: int
+    level_qty: int
+
+
+class LadderBlock(BaseModel):
+    """One resting order in a price level's FIFO queue (front of queue first)."""
+    team_id: str
+    qty: int
+
+
+class LadderLevel(BaseModel):
+    price: float
+    qty: int                    # total shares resting at this level (may exceed
+                                # the sum of `blocks` when the block list is capped)
+    blocks: list[LadderBlock]   # front of queue first (earliest arrival)
+
+
+class LadderSnapshot(BaseModel):
+    """Per-order queue depth ladder for one symbol. OBSERVER/TEACHER ONLY — it
+    exposes each team's resting size, which must never reach competitors. Drives
+    the dashboard QUEUE tab. bids/asks are best price first, capped in depth and
+    in blocks-per-level by the exchange."""
+    type: Literal["ladder_snapshot"] = "ladder_snapshot"
+    symbol: str
+    bids: list[LadderLevel]
+    asks: list[LadderLevel]
 
 
 class TradeExecution(BaseModel):
@@ -196,6 +242,12 @@ class TradeExecution(BaseModel):
     aggressor: Literal["buy", "sell"]
     fee: float                      # fee paid by the taker (aggressor side)
     maker_rebate: float = 0.0       # rebate credited to the maker (resting side)
+    # Explicit passive/aggressive attribution. The maker (resting order) earns
+    # the rebate; the taker (aggressor) pays the fee. Defaults keep older
+    # consumers working. A client compares these to its own team_id to know
+    # whether its fill was passive (good — rebate) or aggressive (paid up).
+    maker_id: str = ""
+    taker_id: str = ""
 
 
 class BookSnapshot(BaseModel):
@@ -214,6 +266,12 @@ class BookSnapshot(BaseModel):
     # "equity" | "future" | … — lets a market maker discover NEW listings
     # (IPOs) without hardcoding a symbol list, while skipping futures.
     asset_type: str = "equity"
+    # Signal inputs (M6) for alpha-in-a-budget bots. microprice = depth-weighted
+    # touch (None→0.0 one-sided); obi = order-book imbalance in [-1, 1] (+bids
+    # heavy). Cheap edges you can act on — but computing more costs latency,
+    # which costs queue position. Defaults keep older consumers working.
+    microprice: float = 0.0
+    obi: float = 0.0
 
 
 class PortfolioUpdate(BaseModel):
@@ -313,8 +371,8 @@ AnyClientMessage = Annotated[
 
 AnyExchangeMessage = Annotated[
     Union[
-        OrderAck, TradeExecution, BookSnapshot, PortfolioUpdate,
-        Leaderboard, SessionEvent, ErrorMsg,
+        OrderAck, QueueUpdate, LadderSnapshot, TradeExecution, BookSnapshot,
+        PortfolioUpdate, Leaderboard, SessionEvent, ErrorMsg,
     ],
     Field(discriminator="type"),
 ]
@@ -335,6 +393,8 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "manual_order": ManualOrder,
     "ipo_subscribe": IPOSubscribe,
     "order_ack": OrderAck,
+    "queue_update": QueueUpdate,
+    "ladder_snapshot": LadderSnapshot,
     "trade_execution": TradeExecution,
     "book_snapshot": BookSnapshot,
     "portfolio_update": PortfolioUpdate,

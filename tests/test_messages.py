@@ -14,6 +14,10 @@ from shared.messages import (
     IPOSubscribe,
     Leaderboard,
     OrderAck,
+    QueueUpdate,
+    LadderSnapshot,
+    LadderLevel,
+    LadderBlock,
     PlaceOrder,
     PortfolioUpdate,
     SecurityDef,
@@ -212,6 +216,60 @@ class TestOrderAck:
                 side="short", price=1.0, quantity=1,
             )
 
+    def test_queue_fields_default_zero(self):
+        # Backward-compat: older senders omit the queue fields.
+        msg = OrderAck(order_id="o", team_id="t", symbol="X",
+                       side="buy", price=1.0, quantity=1)
+        assert msg.queue_ahead == 0 and msg.level_qty == 0
+
+    def test_queue_fields_round_trip(self):
+        msg = OrderAck(order_id="o", team_id="t", symbol="X", side="buy",
+                       price=1.0, quantity=1, queue_ahead=12, level_qty=17)
+        raw = round_trip(msg)
+        assert raw["queue_ahead"] == 12 and raw["level_qty"] == 17
+        parsed = parse_message(raw)
+        assert isinstance(parsed, OrderAck) and parsed.queue_ahead == 12
+
+
+class TestQueueUpdate:
+    def test_round_trip(self):
+        msg = QueueUpdate(order_id="o", team_id="t", symbol="NVDA", side="buy",
+                          price=420.0, queue_ahead=3, level_qty=9)
+        round_trip(msg)
+
+    def test_type_and_dispatch(self):
+        msg = QueueUpdate(order_id="o", team_id="t", symbol="X", side="sell",
+                          price=1.0, queue_ahead=0, level_qty=5)
+        assert msg.type == "queue_update"
+        parsed = parse_message(json.loads(msg.model_dump_json()))
+        assert isinstance(parsed, QueueUpdate) and parsed.queue_ahead == 0
+
+    def test_missing_required_field(self):
+        with pytest.raises(ValidationError):
+            QueueUpdate(order_id="o", team_id="t", symbol="X", side="buy",
+                        price=1.0, queue_ahead=0)   # level_qty missing
+
+
+class TestLadderSnapshot:
+    def _mk(self):
+        return LadderSnapshot(
+            symbol="AAPL",
+            bids=[LadderLevel(price=100.0, qty=8, blocks=[
+                LadderBlock(team_id="a", qty=5), LadderBlock(team_id="b", qty=3)])],
+            asks=[LadderLevel(price=101.0, qty=4, blocks=[
+                LadderBlock(team_id="d", qty=4)])])
+
+    def test_round_trip(self):
+        round_trip(self._mk())
+
+    def test_type_and_dispatch(self):
+        m = self._mk()
+        assert m.type == "ladder_snapshot"
+        parsed = parse_message(json.loads(m.model_dump_json()))
+        assert isinstance(parsed, LadderSnapshot)
+        assert parsed.bids[0].blocks[0].team_id == "a"   # front of queue
+        assert parsed.bids[0].qty == 8
+
 
 class TestTradeExecution:
     def test_round_trip(self):
@@ -246,6 +304,16 @@ class TestBookSnapshot:
             spread=0.50,
         )
         round_trip(msg)
+
+    def test_signal_fields_default_and_round_trip(self):
+        # M6: microprice/obi default to 0.0 (backward compatible)...
+        plain = BookSnapshot(symbol="X", bids=[], asks=[], mid_price=0.0, spread=0.0)
+        assert plain.microprice == 0.0 and plain.obi == 0.0
+        # ...and round-trip when set.
+        msg = BookSnapshot(symbol="AAPL", bids=[[100.0, 5.0]], asks=[[101.0, 3.0]],
+                           mid_price=100.5, spread=1.0, microprice=100.3, obi=0.25)
+        raw = round_trip(msg)
+        assert raw["microprice"] == 100.3 and raw["obi"] == 0.25
 
     def test_type_discriminator(self):
         msg = BookSnapshot(

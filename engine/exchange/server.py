@@ -54,6 +54,10 @@ from shared.messages import (
     Handshake,
     Leaderboard,
     OrderAck,
+    QueueUpdate,
+    LadderSnapshot,
+    LadderLevel,
+    LadderBlock,
     PlaceOrder,
     PortfolioUpdate,
     IPOSubscribe,
@@ -79,7 +83,41 @@ def _new_part_stats() -> dict:
     """Empty cumulative activity record for one participant."""
     return {"trade_count": 0, "volume": 0.0, "buy_count": 0,
             "sell_count": 0, "maker_count": 0,
-            "shares_bought": 0, "shares_sold": 0}
+            "shares_bought": 0, "shares_sold": 0,
+            # Adverse-selection markout sums ($) on our PASSIVE fills, by
+            # horizon; negative = picked off. markout_fills = passive fills
+            # that have reached the 1s horizon (the denominator for avg).
+            "markout_100ms": 0.0, "markout_1s": 0.0, "markout_5s": 0.0,
+            "markout_fills": 0,
+            # Accepted order + cancel messages, for the order-to-trade ratio
+            # (OTR = msgs / trades). Real venues police it; a high OTR is
+            # cancel/replace spam that loads the book without providing fills.
+            "msgs": 0}
+
+
+def _percentile(sorted_values: list[float], p: float) -> float:
+    """The p-th percentile (0..100) of an already-sorted list.
+
+    Hand-rolled linear interpolation between closest ranks — the same method
+    numpy.percentile uses by default, mirrored from scripts/latency_replay.py
+    so the live server-side numbers line up with the offline latency tools.
+    Returns 0.0 for an empty input.
+    """
+    n = len(sorted_values)
+    if n == 0:
+        return 0.0
+    if n == 1:
+        return float(sorted_values[0])
+    if p <= 0:
+        return float(sorted_values[0])
+    if p >= 100:
+        return float(sorted_values[-1])
+    rank = (p / 100.0) * (n - 1)
+    lo = int(rank)
+    hi = min(lo + 1, n - 1)
+    frac = rank - lo
+    return float(sorted_values[lo]
+                 + (sorted_values[hi] - sorted_values[lo]) * frac)
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +419,21 @@ class ExchangeServer:
         # Cumulative per-participant activity, updated incrementally on every
         # fill so _build_leaderboard() stays O(teams) instead of O(trades).
         self.part_stats: dict[str, dict] = defaultdict(_new_part_stats)
+        # ── Reaction-latency measurement (HFT course variant) ──────────
+        # Wall-clock (perf_counter) stamp of the most recent BookSnapshot
+        # BROADCAST per symbol, and a rolling per-bot buffer of the elapsed
+        # microseconds from that market update to the bot's next accepted
+        # order on the symbol. Authoritative: the bot cannot fabricate it.
+        self._last_snapshot_ts: dict[str, float] = {}
+        self._latency_samples: dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=config.LATENCY_SAMPLE_MAXLEN))
+        # order_id → last (queue_ahead, level_qty) pushed, so QueueUpdate fires
+        # only when a bot's standing actually changes (not on every trade).
+        self._queue_cache: dict[str, tuple[int, int]] = {}
+        # Pending markout evaluations for PASSIVE fills. Each record:
+        # {t: fill wall-time, symbol, maker_id, signed_qty (+long/-short),
+        #  mid: mark at fill, done: set of horizons already scored}.
+        self._pending_markouts: list[dict] = []
         # symbol → last good internal reference (microprice). Held across a
         # one-sided book so the fair value never teleports; see
         # _internal_reference.
@@ -975,6 +1028,7 @@ class ExchangeServer:
 
         # ── Match ────────────────────────────────────────────────────
         book = self.books[msg.symbol]
+        self.part_stats[team_id]["msgs"] += 1   # order-to-trade ratio numerator
         order, trades = book.place_order(
             team_id=team_id,
             side=msg.side,
@@ -991,6 +1045,18 @@ class ExchangeServer:
             ))
             return
 
+        # ── HFT reaction latency (authoritative) ──────────────────────
+        # This order was accepted: record the elapsed time since the last
+        # market update we broadcast on this symbol. Same perf_counter clock
+        # as the snapshot stamp, so the delta is the bot's true reaction time,
+        # measured server-side and unfakeable. Only real trading bots count.
+        if config.LATENCY_STATS_ENABLED and portfolio.role in ("trader", "broker"):
+            now = time.perf_counter()
+            last = self._last_snapshot_ts.get(msg.symbol, now)
+            latency_us = (now - last) * 1e6
+            if latency_us >= 0:
+                self._latency_samples[team_id].append(latency_us)
+
         # Self-trade prevention: tell the owner its resting order was
         # cancelled rather than matched against its own incoming order.
         for cancelled in book.stp_cancels:
@@ -1004,6 +1070,10 @@ class ExchangeServer:
                              f"prevention (your own order crossed it)"),
                 ))
 
+        # Queue standing at the moment we rest (0/0 if fully filled or feature
+        # off). Lets a bot know where it sits the instant its order is live.
+        qa, lq = (book.queue_position(order.order_id)
+                  if config.QUEUE_FEEDBACK_ENABLED else (0, 0))
         await self._send(ws, OrderAck(
             order_id=order.order_id,
             team_id=team_id,
@@ -1011,7 +1081,15 @@ class ExchangeServer:
             side=msg.side,
             price=order.price,
             quantity=order.quantity,
+            queue_ahead=qa,
+            level_qty=lq,
         ))
+
+        # STP-cancelled resting orders vacated their levels; refresh the bots
+        # queued behind them before we process fills.
+        for c in book.stp_cancels:
+            self._queue_cache.pop(c.order_id, None)
+            await self._push_queue_updates(msg.symbol, c.side, c.price)
 
         for trade in trades:
             await self._process_trade(trade)
@@ -1139,6 +1217,13 @@ class ExchangeServer:
             return
 
         self._charge_cancel_fee(team_id, cancelled)
+        self.part_stats[team_id]["msgs"] += 1   # cancels count toward OTR too
+
+        # The cancelled order vacated its spot; bots behind it advanced.
+        self._queue_cache.pop(cancelled.order_id, None)
+        await self._push_queue_updates(cancelled.symbol, cancelled.side,
+                                       cancelled.price)
+        await self._broadcast_ladder(cancelled.symbol)
 
     async def _handle_teacher_command(
         self, ws: Any, msg: TeacherCommand, team_id: str
@@ -1550,6 +1635,80 @@ class ExchangeServer:
         }
 
     # ------------------------------------------------------------------
+    # Queue feedback (M1)
+    # ------------------------------------------------------------------
+
+    async def _push_queue_updates(self, symbol: str, side: str,
+                                  price: float) -> None:
+        """Push a QueueUpdate to every connected owner of a resting order at one
+        price level whose FIFO standing changed (a fill/cancel ahead moved it).
+
+        Owner-only — a team never sees a competitor's resting size. No-op when
+        queue feedback is disabled (opaque-queue mode). Change-gated via
+        _queue_cache so a busy level does not spam identical updates.
+        """
+        if not config.QUEUE_FEEDBACK_ENABLED:
+            return
+        book = self.books.get(symbol)
+        if book is None:
+            return
+        for o in book.orders_at(side, price):
+            ws = self.clients.get(o.team_id)
+            if ws is None:
+                continue
+            qa, lq = book.queue_position(o.order_id)
+            if self._queue_cache.get(o.order_id) == (qa, lq):
+                continue
+            self._queue_cache[o.order_id] = (qa, lq)
+            await self._send(ws, QueueUpdate(
+                order_id=o.order_id, team_id=o.team_id, symbol=symbol,
+                side=side, price=price, queue_ahead=qa, level_qty=lq))
+
+    async def _broadcast_observers(self, message: Any) -> None:
+        """Send to observer + teacher connections only, never to trading bots.
+        The queue ladder reveals per-team resting size, so it must not reach a
+        competitor's client."""
+        payload = message.model_dump_json()
+        coros = [self._send_payload(tid, ws, payload)
+                 for tid, ws in list(self.clients.items())
+                 if tid.startswith("observer:") or tid in self.teacher_clients]
+        if coros:
+            await asyncio.gather(*coros, return_exceptions=True)
+
+    def _make_ladder(self, symbol: str, book: OrderBook) -> LadderSnapshot:
+        """Per-order queue ladder for a symbol: top LADDER_DEPTH price levels
+        each side, front-of-queue first, blocks-per-level capped."""
+        snap = book.get_snapshot(depth=config.LADDER_DEPTH)
+        cap = config.LADDER_MAX_BLOCKS
+
+        def levels(side: str, rows: list) -> list[LadderLevel]:
+            out: list[LadderLevel] = []
+            for price, agg in rows:
+                blocks = [LadderBlock(team_id=o.team_id, qty=o.remaining)
+                          for o in book.orders_at(side, price)[:cap]]
+                out.append(LadderLevel(price=price, qty=int(agg), blocks=blocks))
+            return out
+
+        return LadderSnapshot(symbol=symbol,
+                              bids=levels("buy", snap["bids"]),
+                              asks=levels("sell", snap["asks"]))
+
+    def _has_ladder_viewers(self) -> bool:
+        """True if any observer/teacher is connected to receive the ladder."""
+        return any(tid.startswith("observer:") or tid in self.teacher_clients
+                   for tid in self.clients)
+
+    async def _broadcast_ladder(self, symbol: str) -> None:
+        """Push the queue ladder for one symbol to observers/teacher (no-op if
+        disabled, unknown symbol, or nobody is watching — so a normal session
+        with no dashboard attached does zero ladder work)."""
+        if not config.LADDER_SNAPSHOT_ENABLED or not self._has_ladder_viewers():
+            return
+        book = self.books.get(symbol)
+        if book is not None:
+            await self._broadcast_observers(self._make_ladder(symbol, book))
+
+    # ------------------------------------------------------------------
     # Trade settlement
     # ------------------------------------------------------------------
 
@@ -1562,6 +1721,8 @@ class ExchangeServer:
         keeps the difference. Legacy model: trade.fee split 50/50.
         """
         notional = trade.price * trade.quantity
+        # Mark BEFORE this trade's own impact is applied — the markout baseline.
+        mid_at_fill = self.ref_prices.get(trade.symbol)
 
         if config.MAKER_TAKER_ENABLED:
             # Fee tier is per team: a team that bought the fee_tier upgrade
@@ -1618,6 +1779,18 @@ class ExchangeServer:
                 seller.apply_sell(trade.symbol, trade.price, trade.quantity,
                                   seller_fee, seller_rebate)
 
+        # Passive/aggressive attribution — a pure function of the aggressor,
+        # so it holds under both the maker/taker and the legacy flat-fee paths.
+        m_id = trade.seller_id if trade.aggressor == "buy" else trade.buyer_id
+        t_id = trade.buyer_id if trade.aggressor == "buy" else trade.seller_id
+        # Queue an adverse-selection markout for the maker. The maker is long
+        # (+qty) when the taker sold into its resting bid, short (-qty) when the
+        # taker lifted its resting ask.
+        if config.MARKOUT_ENABLED and mid_at_fill:
+            signed = trade.quantity if trade.aggressor == "sell" else -trade.quantity
+            self._pending_markouts.append({
+                "t": time.time(), "symbol": trade.symbol, "maker_id": m_id,
+                "signed_qty": signed, "mid": mid_at_fill, "done": set()})
         trade_msg = TradeExecution(
             trade_id=trade.trade_id,
             symbol=trade.symbol,
@@ -1628,6 +1801,8 @@ class ExchangeServer:
             aggressor=trade.aggressor,
             fee=fee_paid,
             maker_rebate=rebate_paid,
+            maker_id=m_id,
+            taker_id=t_id,
         )
 
         buyer_ws = self.clients.get(trade.buyer_id)
@@ -1663,6 +1838,11 @@ class ExchangeServer:
         # Buyer and seller already received it directly above.
         await self._broadcast(trade_msg, skip_ids={trade.buyer_id, trade.seller_id})
         await self._broadcast(self._make_snapshot(trade.symbol, self.books[trade.symbol]))
+        # A fill consumed the front of the resting (maker) side at this price,
+        # so bots queued behind it just advanced — tell them.
+        maker_side = "sell" if trade.aggressor == "buy" else "buy"
+        await self._push_queue_updates(trade.symbol, maker_side, trade.price)
+        await self._broadcast_ladder(trade.symbol)
         # NO leaderboard push here: broadcasting a full leaderboard to every
         # client per trade is O(clients × trades) and was the load-test
         # bottleneck (45 conns fine, 90 saturated). The 2-second leaderboard
@@ -1702,6 +1882,8 @@ class ExchangeServer:
                 continue
             for symbol, book in self.books.items():
                 await self._broadcast(self._make_snapshot(symbol, book))
+                # Observer/teacher-only per-order queue ladder for the QUEUE tab.
+                await self._broadcast_ladder(symbol)
 
     async def _leaderboard_loop(self) -> None:
         """Push the leaderboard every LEADERBOARD_INTERVAL_SEC whenever clients are connected."""
@@ -1709,6 +1891,44 @@ class ExchangeServer:
             await asyncio.sleep(config.LEADERBOARD_INTERVAL_SEC)
             if self.clients:
                 await self._broadcast(self._build_leaderboard())
+
+    async def _markout_loop(self) -> None:
+        """Score pending passive-fill markouts as each horizon elapses.
+
+        markout = (mark_now - mark_at_fill) × signed_qty, attributed to the
+        maker. Negative = the maker was adversely selected — the mark moved
+        against the fill (the "my fastest fills are my worst fills" lesson).
+        """
+        while True:
+            await asyncio.sleep(0.1)
+            if self._pending_markouts:
+                self._score_markouts(time.time())
+
+    # Fixed teaching horizons: 100ms / 1s / 5s.
+    _MARKOUT_HORIZONS = ((0.1, "markout_100ms"), (1.0, "markout_1s"),
+                         (5.0, "markout_5s"))
+
+    def _score_markouts(self, now: float) -> None:
+        """Score every pending markout whose horizon has elapsed as of `now`,
+        dropping records once all horizons are done. Sync + clock-injected so
+        it is unit-testable."""
+        keep: list[dict] = []
+        for rec in self._pending_markouts:
+            age = now - rec["t"]
+            mark = self.ref_prices.get(rec["symbol"])
+            for secs, key in self._MARKOUT_HORIZONS:
+                if secs in rec["done"] or age < secs:
+                    continue
+                rec["done"].add(secs)
+                if mark is None:
+                    continue
+                ps = self.part_stats[rec["maker_id"]]
+                ps[key] += (mark - rec["mid"]) * rec["signed_qty"]
+                if secs == 1.0:
+                    ps["markout_fills"] += 1
+            if len(rec["done"]) < len(self._MARKOUT_HORIZONS):
+                keep.append(rec)
+        self._pending_markouts = keep
 
     async def _price_tick_loop(self) -> None:
         """Advance prices once per second through supply/demand.
@@ -3509,12 +3729,20 @@ class ExchangeServer:
     # ------------------------------------------------------------------
 
     def _make_snapshot(self, symbol: str, book: OrderBook) -> BookSnapshot:
+        # Stamp the moment this market update goes out, so the next order on
+        # this symbol can be timed against it (HFT reaction-latency measure).
+        # perf_counter matches the clock used at the order site in
+        # _handle_place_order.
+        if config.LATENCY_STATS_ENABLED:
+            self._last_snapshot_ts[symbol] = time.perf_counter()
         snap = book.get_snapshot()
         mid = snap["mid_price"]
         spd = snap["spread"]
         ref = self.ref_prices.get(symbol, 0.0)
         entry = self.registry.securities.get(symbol) or {}
         defn = entry.get("defn")
+        # Signal inputs (M6): depth-weighted touch + order-book imbalance.
+        mp = price_engine.microprice(snap["bids"], snap["asks"])
         return BookSnapshot(
             symbol=symbol,
             bids=snap["bids"],
@@ -3523,7 +3751,33 @@ class ExchangeServer:
             spread=spd if spd is not None else 0.0,
             ref_price=ref,
             asset_type=getattr(defn, "asset_type", "equity") or "equity",
+            microprice=mp if mp is not None else (mid if mid is not None else ref),
+            obi=round(book.order_book_imbalance(), 4),
         )
+
+    def _latency_stats(self, team_id: str) -> dict:
+        """Rolling reaction-latency percentiles (µs) for one bot.
+
+        Returns {"lat_p50_us", "lat_p99_us", "lat_p999_us", "lat_samples"} from
+        the bot's sample buffer, all None/0 when the feature is off or the bot
+        has not reacted to a market update yet. Lower is faster. p99.9 is the
+        tail races are actually won on — needs a deep buffer to be meaningful
+        (see config.LATENCY_SAMPLE_MAXLEN).
+        """
+        if not config.LATENCY_STATS_ENABLED:
+            return {"lat_p50_us": None, "lat_p99_us": None,
+                    "lat_p999_us": None, "lat_samples": 0}
+        samples = self._latency_samples.get(team_id)
+        if not samples:
+            return {"lat_p50_us": None, "lat_p99_us": None,
+                    "lat_p999_us": None, "lat_samples": 0}
+        s = sorted(samples)
+        return {
+            "lat_p50_us": round(_percentile(s, 50), 1),
+            "lat_p99_us": round(_percentile(s, 99), 1),
+            "lat_p999_us": round(_percentile(s, 99.9), 1),
+            "lat_samples": len(s),
+        }
 
     def _build_leaderboard(self) -> Leaderboard:
         traders, brokers = [], []
@@ -3580,13 +3834,51 @@ class ExchangeServer:
                 "role":        self.portfolios[tid].role if tid in self.portfolios else "unknown",
                 "trade_count": round(ps["trade_count"], 0),
                 "volume":      round(ps["volume"], 2),
+                # Passive vs aggressive: maker_count fills earned the rebate.
+                # passive_pct = share of our fills that were passive (0..100).
+                "maker_count": ps["maker_count"],
+                "passive_pct": round(100.0 * ps["maker_count"] / ps["trade_count"], 1)
+                               if ps["trade_count"] else None,
                 "fees_paid":   round(self.portfolios[tid].total_fees_paid, 4)
                                if tid in self.portfolios else 0.0,
                 "rebates_earned": round(self.portfolios[tid].total_rebates_earned, 4)
                                   if tid in self.portfolios else 0.0,
+                # Adverse-selection markout on passive fills ($ sum; negative =
+                # picked off). markout_1s is the headline horizon.
+                "markout_1s":  round(ps["markout_1s"], 2),
+                "markout_5s":  round(ps["markout_5s"], 2),
+                "markout_fills": ps["markout_fills"],
+                # Message discipline (M7): order+cancel messages and the
+                # order-to-trade ratio. High OTR = book-loading cancel/replace
+                # spam; real venues cap it.
+                "msgs": ps["msgs"],
+                "otr":  round(ps["msgs"] / max(1, ps["trade_count"]), 1),
+                # Market-making quality (M5): a pure sum of real dollar
+                # components — closed P&L + passive rebate income − adverse
+                # selection (1s markout) − inventory financing. No arbitrary
+                # weights; rewards tight, well-hedged, rebate-capturing MM.
+                "mm_score": round(
+                    (self.portfolios[tid].realized_pnl
+                     + self.portfolios[tid].total_rebates_earned
+                     + ps["markout_1s"]
+                     - self.portfolios[tid].total_carry_paid), 2)
+                    if tid in self.portfolios else 0.0,
+                # Reaction latency (µs, server-side, HFT variant). Additive:
+                # absent/None on old consumers. Keys stay consistent across
+                # server → leaderboard → dashboard.
+                **self._latency_stats(tid),
             }
             for tid, ps in part_stats.items()
         ]
+        # M6: P&L net of consumed latency (only when the instructor enables the
+        # penalty — otherwise no field, so scoring is untouched by default).
+        if config.LATENCY_PENALTY_PER_MS:
+            for row in participants:
+                p99_ms = (row.get("lat_p99_us") or 0.0) / 1000.0
+                row["net_score"] = round(
+                    row.get("mm_score", 0.0)
+                    - config.LATENCY_PENALTY_PER_MS * p99_ms, 2)
+
         participants.sort(key=lambda x: x["volume"], reverse=True)
 
         return Leaderboard(
@@ -3798,6 +4090,7 @@ async def main() -> None:
             await asyncio.gather(
                 server._book_snapshot_loop(),
                 server._leaderboard_loop(),
+                server._markout_loop(),
                 server._price_tick_loop(),
                 server._teacher_cli(),
             )

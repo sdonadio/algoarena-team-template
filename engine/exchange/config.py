@@ -446,6 +446,46 @@ ORDER_QUOTA_BURST_MULTIPLE = float(os.environ.get("ORDER_QUOTA_BURST_MULTIPLE", 
 CANCEL_FEE_PER_ORDER = float(os.environ.get("CANCEL_FEE_PER_ORDER", "0.05"))
 CANCEL_FEE_PER_SHARE = float(os.environ.get("CANCEL_FEE_PER_SHARE", "0.0"))
 
+# ── Reaction-latency measurement (HFT course variant) ─────────────────────────
+# The exchange stamps the wall-clock time of every book snapshot it broadcasts
+# per symbol, then measures the elapsed time to each bot's next accepted order
+# on that symbol — its server-side, unfakeable REACTION LATENCY. Rolling
+# per-bot p50/p99 (microseconds) ride along in the leaderboard's `participants`
+# rows and surface on the dashboard's exchange detail card. Cheap, but gated so
+# it can be switched off entirely on branches/courses that don't want it.
+LATENCY_STATS_ENABLED = os.environ.get("LATENCY_STATS", "true").lower() in ("true", "1", "yes")
+# How many recent reaction-latency samples to retain per bot for the percentiles.
+# Needs to be deep enough that the p99.9 tail is meaningful (~1000+ samples);
+# 2000 keeps a stable tail without much memory (a few KB per bot).
+LATENCY_SAMPLE_MAXLEN = int(os.environ.get("LATENCY_SAMPLE_MAXLEN", "2000"))
+
+# Queue feedback: when on, the exchange tells a bot its FIFO queue standing —
+# queue_ahead/level_qty on the OrderAck, and a QueueUpdate push (owner-only)
+# when a fill or cancel ahead of it moves it. Turn OFF for the "opaque queue"
+# capstone, where students must estimate position from the trade/cancel tape.
+QUEUE_FEEDBACK_ENABLED = os.environ.get("QUEUE_FEEDBACK", "true").lower() in ("true", "1", "yes")
+
+# Queue depth-ladder feed for the dashboard QUEUE tab: per-order blocks per
+# price level, OBSERVER/TEACHER ONLY (reveals per-team resting size). Independent
+# of QUEUE_FEEDBACK (the teacher always sees the true ladder, even in the opaque
+# capstone). Bounded by LADDER_DEPTH price levels and LADDER_MAX_BLOCKS per level.
+LADDER_SNAPSHOT_ENABLED = os.environ.get("LADDER_SNAPSHOT", "true").lower() in ("true", "1", "yes")
+LADDER_DEPTH = int(os.environ.get("LADDER_DEPTH", "6"))
+LADDER_MAX_BLOCKS = int(os.environ.get("LADDER_MAX_BLOCKS", "25"))
+
+# Markouts / adverse selection: after a PASSIVE (maker) fill, how did the mark
+# move against the maker over the next 100ms / 1s / 5s? Negative markout = the
+# maker got picked off ("my fastest fills are my worst fills"). Attributed to
+# the maker only. Horizons are fixed at 100ms/1s/5s (the standard teaching set).
+MARKOUT_ENABLED = os.environ.get("MARKOUT", "true").lower() in ("true", "1", "yes")
+
+# M6: optional explicit latency penalty so "P&L net of the latency you spent"
+# is visible even in a scenario where latency does not naturally bite.
+#   net_score = mm_score - LATENCY_PENALTY_PER_MS * p99_latency_ms
+# Default 0.0 (OFF) — a game-balance knob for the instructor to tune per
+# scenario. When 0, net_score is not emitted (no silent balance change).
+LATENCY_PENALTY_PER_MS = float(os.environ.get("LATENCY_PENALTY_PER_MS", "0.0"))
+
 # ── Latency tiers (week 7) ────────────────────────────────────────────────────
 # When the week's `latency_enabled` flag is on, the exchange delays each
 # team's OUTBOUND messages by its tier. Observers and the teacher are never

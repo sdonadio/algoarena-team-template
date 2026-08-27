@@ -41,6 +41,9 @@ class Order:
     timestamp: float
     order_type: Literal["limit", "market", "ioc", "post_only"]
     rejected: bool = False   # post-only order that would have crossed
+    seq: int = 0             # monotonic arrival sequence — the true time-priority
+                             # key (timestamp is a float and can tie; seq never
+                             # does, so queue order is exact)
 
 
 @dataclass
@@ -85,10 +88,16 @@ class OrderBook:
         self.auction_mode = False
 
         # Min-heaps for fast best-price access (entries are deleted lazily).
-        #   _bids: (-price, timestamp, order_id)  →  highest price pops first
-        #   _asks: ( price, timestamp, order_id)  →  lowest  price pops first
+        #   _bids: (-price, seq, order_id)  →  highest price, then earliest, pops first
+        #   _asks: ( price, seq, order_id)  →  lowest  price, then earliest, pops first
+        # seq (not timestamp) is the tiebreak so equal-price orders keep strict
+        # arrival order — the basis of exact queue position.
         self._bids: list[tuple] = []
         self._asks: list[tuple] = []
+
+        # Monotonic arrival counter; every placed order gets the next value as
+        # its time-priority key. Never resets within a book's life.
+        self._seq: int = 0
 
         # order_id → Order for every live resting order.
         # Removing an entry here is the canonical delete; heaps clean up lazily.
@@ -120,6 +129,7 @@ class OrderBook:
         if order_type != "market":            # market orders carry no price
             price = self.snap_to_tick(price, side)
         now = time.time()
+        self._seq += 1
         order = Order(
             order_id=str(uuid.uuid4()),
             team_id=team_id,
@@ -130,6 +140,7 @@ class OrderBook:
             remaining=quantity,
             timestamp=now,
             order_type=order_type,
+            seq=self._seq,
         )
 
         if self.auction_mode:
@@ -137,9 +148,9 @@ class OrderBook:
             # rejects non-limit types before they get here.
             self._orders[order.order_id] = order
             if side == "buy":
-                heapq.heappush(self._bids, (-order.price, now, order.order_id))
+                heapq.heappush(self._bids, (-order.price, order.seq, order.order_id))
             else:
-                heapq.heappush(self._asks, (order.price, now, order.order_id))
+                heapq.heappush(self._asks, (order.price, order.seq, order.order_id))
             return order, []
 
         if order_type == "post_only":
@@ -158,9 +169,9 @@ class OrderBook:
         if order_type in ("limit", "post_only") and order.remaining > 0:
             self._orders[order.order_id] = order
             if side == "buy":
-                heapq.heappush(self._bids, (-price, now, order.order_id))
+                heapq.heappush(self._bids, (-price, order.seq, order.order_id))
             else:
-                heapq.heappush(self._asks, (price, now, order.order_id))
+                heapq.heappush(self._asks, (price, order.seq, order.order_id))
 
         return order, trades
 
@@ -192,6 +203,43 @@ class OrderBook:
         kf = key_fn or self._stp_key
         return sum(o.remaining for o in self._orders.values()
                    if o.side == side and kf(o.team_id) == key)
+
+    def queue_position(self, order_id: str) -> tuple[int, int]:
+        """FIFO queue standing of a resting order: (qty_ahead, level_qty).
+
+        qty_ahead — shares resting at the same price+side that will fill BEFORE
+        this order (strictly earlier arrival, i.e. smaller seq). level_qty —
+        total shares resting at that price+side (the displayed level size).
+
+        Returns (0, 0) if the order is not resting (unknown / fully filled /
+        cancelled). A brand-new order at the back of a level has
+        qty_ahead == level_qty - its_own_remaining; the front of the queue has
+        qty_ahead == 0. Iterates the canonical live set (_orders), consistent
+        with get_snapshot / open_quantity — the heaps hold lazily-stale entries.
+        """
+        target = self._orders.get(order_id)
+        if target is None:
+            return 0, 0
+        qty_ahead = 0
+        level_qty = 0
+        for o in self._orders.values():
+            if o.side != target.side or o.price != target.price:
+                continue
+            level_qty += o.remaining
+            if o.seq < target.seq:
+                qty_ahead += o.remaining
+        return qty_ahead, level_qty
+
+    def orders_at(self, side: Literal["buy", "sell"], price: float) -> list[Order]:
+        """Resting orders at one price level, front of queue first (by seq).
+
+        Front-to-back FIFO order. Used to push per-owner queue updates and,
+        later, to render the queue depth-ladder.
+        """
+        return sorted(
+            (o for o in self._orders.values()
+             if o.side == side and o.price == price),
+            key=lambda o: o.seq)
 
     def get_snapshot(self, depth: int = 10) -> dict:
         """Return a depth-limited book view plus market statistics."""
@@ -282,9 +330,9 @@ class OrderBook:
         feed venues publish during the pre-open.
         """
         bids = sorted((o for o in self._orders.values() if o.side == "buy"),
-                      key=lambda o: (-o.price, o.timestamp))
+                      key=lambda o: (-o.price, o.seq))
         asks = sorted((o for o in self._orders.values() if o.side == "sell"),
-                      key=lambda o: (o.price, o.timestamp))
+                      key=lambda o: (o.price, o.seq))
         if not bids or not asks or bids[0].price < asks[0].price:
             return None
 
@@ -325,10 +373,10 @@ class OrderBook:
             "buy" if preview["imbalance"] >= 0 else "sell")
 
         bids = [o for o in sorted(self._orders.values(),
-                                  key=lambda o: (-o.price, o.timestamp))
+                                  key=lambda o: (-o.price, o.seq))
                 if o.side == "buy" and o.price >= clearing]
         asks = [o for o in sorted(self._orders.values(),
-                                  key=lambda o: (o.price, o.timestamp))
+                                  key=lambda o: (o.price, o.seq))
                 if o.side == "sell" and o.price <= clearing]
 
         bi = 0

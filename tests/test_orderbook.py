@@ -613,3 +613,78 @@ class TestTickSize:
         _, trades = book.place_order("t", "buy", 100.238, 5)
         assert trades == []
         assert book.best_bid() == pytest.approx(100.23)
+
+
+# ---------------------------------------------------------------------------
+# Queue position & arrival sequence (M1)
+# ---------------------------------------------------------------------------
+
+class TestQueuePosition:
+    def test_seq_is_monotonic_and_orders_true_arrival(self):
+        ob = OrderBook("AAPL")
+        o1, _ = place_buy(ob, "a", 100.0, 5)
+        o2, _ = place_buy(ob, "b", 100.0, 3)
+        o3, _ = place_buy(ob, "c", 100.0, 2)
+        assert o1.seq < o2.seq < o3.seq
+        # Front of the level (earliest seq) has nothing ahead.
+        assert ob.queue_position(o1.order_id) == (0, 10)
+        # Second in queue: 5 ahead, level total 10.
+        assert ob.queue_position(o2.order_id) == (5, 10)
+        # Back of the queue: 8 ahead.
+        assert ob.queue_position(o3.order_id) == (8, 10)
+
+    def test_level_qty_is_per_price_and_side(self):
+        ob = OrderBook("AAPL")
+        a, _ = place_buy(ob, "a", 100.0, 5)
+        place_buy(ob, "b", 99.0, 7)        # different price — not counted
+        place_sell(ob, "c", 101.0, 4)      # other side — not counted
+        assert ob.queue_position(a.order_id) == (0, 5)
+
+    def test_unknown_or_filled_order_is_zero(self):
+        ob = OrderBook("AAPL")
+        assert ob.queue_position("nope") == (0, 0)
+        # A marketable order that fully fills never rests → not tracked.
+        place_sell(ob, "m", 100.0, 5)
+        taker, trades = place_buy(ob, "t", 100.0, 5)
+        assert taker.remaining == 0
+        assert ob.queue_position(taker.order_id) == (0, 0)
+
+    def test_cancel_ahead_advances_those_behind(self):
+        ob = OrderBook("AAPL")
+        front, _ = place_buy(ob, "a", 100.0, 5)
+        mid, _ = place_buy(ob, "b", 100.0, 3)
+        back, _ = place_buy(ob, "c", 100.0, 2)
+        assert ob.queue_position(back.order_id) == (8, 10)
+        ob.cancel_order(front.order_id, "a")
+        # Front gone: back now has only mid (3) ahead, level shrank to 5.
+        assert ob.queue_position(back.order_id) == (3, 5)
+        assert ob.queue_position(mid.order_id) == (0, 5)
+
+    def test_partial_fill_ahead_advances_the_queue(self):
+        ob = OrderBook("AAPL")
+        front, _ = place_buy(ob, "a", 100.0, 5)
+        back, _ = place_buy(ob, "b", 100.0, 4)
+        assert ob.queue_position(back.order_id) == (5, 9)
+        # A sell hits 3 of the front order.
+        place_sell(ob, "x", 100.0, 3)
+        assert ob.queue_position(back.order_id) == (2, 6)
+
+    def test_reprice_goes_to_back_of_queue(self):
+        ob = OrderBook("AAPL")
+        a, _ = place_buy(ob, "a", 100.0, 5)   # front
+        b, _ = place_buy(ob, "b", 100.0, 3)
+        c, _ = place_buy(ob, "c", 100.0, 2)
+        assert ob.queue_position(a.order_id) == (0, 10)
+        # "a" reprices (cancel + new at same price) — loses time priority.
+        ob.cancel_order(a.order_id, "a")
+        a2, _ = place_buy(ob, "a", 100.0, 5)
+        # a2 is now behind b and c: 3 + 2 = 5 ahead, level back to 10.
+        assert ob.queue_position(a2.order_id) == (5, 10)
+
+    def test_orders_at_is_front_to_back(self):
+        ob = OrderBook("AAPL")
+        a, _ = place_buy(ob, "a", 100.0, 5)
+        b, _ = place_buy(ob, "b", 100.0, 3)
+        ids = [o.order_id for o in ob.orders_at("buy", 100.0)]
+        assert ids == [a.order_id, b.order_id]
+        assert ob.orders_at("sell", 100.0) == []

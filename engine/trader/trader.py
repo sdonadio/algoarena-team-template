@@ -244,6 +244,15 @@ class Portfolio:
         self.total_fees_paid: float = 0.0
         self._unrealized_pnl: float = 0.0
         self._net_worth: float = config.STARTING_CASH
+        # Earned-leverage / margin telemetry (0 unless the venue runs with
+        # LEVERAGE_ENABLED). gross_exposure = |notional| of equity positions;
+        # leverage = gross/equity; margin_ratio = equity/gross; borrowed =
+        # financed notional; max_leverage = your level's leverage cap.
+        self.gross_exposure: float = 0.0
+        self.leverage: float = 0.0
+        self.margin_ratio: float = 0.0
+        self.borrowed: float = 0.0
+        self.max_leverage: float = 0.0
 
     def apply_server_update(self, update: PortfolioUpdate) -> None:
         """Sync all fields from an authoritative PortfolioUpdate message."""
@@ -253,6 +262,11 @@ class Portfolio:
         self.total_fees_paid = update.total_fees_paid
         self._unrealized_pnl = update.unrealized_pnl
         self._net_worth = update.net_worth
+        self.gross_exposure = getattr(update, "gross_exposure", 0.0)
+        self.leverage = getattr(update, "leverage", 0.0)
+        self.margin_ratio = getattr(update, "margin_ratio", 0.0)
+        self.borrowed = getattr(update, "borrowed", 0.0)
+        self.max_leverage = getattr(update, "max_leverage", 0.0)
 
     def net_worth(self, market: MarketData) -> float:  # noqa: ARG002
         """Current net worth — cash + mark-to-market value of all positions."""

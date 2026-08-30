@@ -286,6 +286,13 @@ class PortfolioUpdate(BaseModel):
     total_carry_paid: float = 0.0     # margin interest + short borrow fees
     liquidated: bool = False
     net_worth: float
+    # Earned-leverage / margin telemetry (default-zero; only meaningful when
+    # the exchange runs with config.LEVERAGE_ENABLED).
+    gross_exposure: float = 0.0
+    leverage: float = 0.0
+    margin_ratio: float = 0.0
+    borrowed: float = 0.0
+    max_leverage: float = 0.0
 
 
 class Leaderboard(BaseModel):

@@ -144,6 +144,10 @@ class Portfolio:
     # which this book is exempt from the maintenance check. Not persisted —
     # a grace period is a within-session courtesy, not a season-long one.
     shield_until_tick: int = 0
+    # One-shot latch for the earned-leverage margin call (config.LEVERAGE_ENABLED):
+    # set when margin_ratio first falls below MARGIN_CALL_RATIO so the warning
+    # fires once, cleared when the team recovers back above the ratio.
+    margin_called: bool = False
 
     def __post_init__(self) -> None:
         if not self.starting_cash:
@@ -296,6 +300,45 @@ class Portfolio:
                 mv += qty * ref
         return self.cash + mv
 
+    # -- Leverage / margin views (read-only; see config.LEVERAGE_ENABLED) ----
+
+    def gross_exposure(self, ref_prices: dict[str, float]) -> float:
+        """Absolute market value of all non-future (equity) positions.
+
+        Futures post margin rather than notional, so they are excluded — the
+        leverage regime governs equity gross exposure.
+        """
+        total = 0.0
+        for sym, qty in self.positions.items():
+            if qty and not config.is_future(sym):
+                total += abs(qty) * ref_prices.get(sym, self.avg_cost.get(sym, 0.0))
+        return total
+
+    def equity(self, ref_prices: dict[str, float]) -> float:
+        """Mark-to-market equity — the same figure as net_worth()."""
+        return self.net_worth(ref_prices)
+
+    def leverage(self, ref_prices: dict[str, float]) -> float:
+        """Gross exposure / equity. Returns a large sentinel when equity<=0."""
+        eq = self.equity(ref_prices)
+        if eq <= 0:
+            return 1e9
+        return self.gross_exposure(ref_prices) / eq
+
+    def margin_ratio(self, ref_prices: dict[str, float]) -> float:
+        """Equity / gross exposure — the coverage the margin call watches.
+
+        Returns a large sentinel (999) when there is no gross exposure at all.
+        """
+        gross = self.gross_exposure(ref_prices)
+        if gross <= 0:
+            return 999.0
+        return self.equity(ref_prices) / gross
+
+    def borrowed(self, ref_prices: dict[str, float]) -> float:
+        """Financed portion of the book: max(0, gross - equity)."""
+        return max(0.0, self.gross_exposure(ref_prices) - self.equity(ref_prices))
+
     def to_message(self, ref_prices: dict[str, float]) -> PortfolioUpdate:
         live = {sym: qty for sym, qty in self.positions.items() if qty}
         return PortfolioUpdate(
@@ -309,6 +352,11 @@ class Portfolio:
             total_carry_paid=round(self.total_carry_paid, 4),
             liquidated=self.liquidated,
             net_worth=round(self.net_worth(ref_prices), 4),
+            gross_exposure=round(self.gross_exposure(ref_prices), 4),
+            leverage=round(self.leverage(ref_prices), 4),
+            margin_ratio=round(self.margin_ratio(ref_prices), 4),
+            borrowed=round(self.borrowed(ref_prices), 4),
+            max_leverage=config.leverage_for(self.level),
         )
 
 
@@ -844,13 +892,16 @@ class ExchangeServer:
             ))
             return
 
-        # Per-symbol position limit — enforced at TEAM scope and counting
-        # RESTING orders (audit H2). Otherwise a team split the same risk
-        # across N seats (N× the cap) and one bot rested N sub-limit orders
-        # that all filled through the cap. Worst case: every same-side resting
-        # order for the team fills, plus this order.
-        limit = self.position_limit_for(team_id)
-        if limit > 0:
+        if config.LEVERAGE_ENABLED:
+            # ── Earned-leverage regime ────────────────────────────────────
+            # An EQUITY-based cap replaces the flat share limit AND the
+            # cash-only buying-power test: the team may run gross notional up
+            # to leverage_for(level) × equity. Worst case counts every
+            # same-side resting order filling on top of this one (the audit-H2
+            # "counting resting orders" exposure logic, reused).
+            max_lev = config.leverage_for(portfolio.level)
+            equity = portfolio.equity(self.ref_prices)
+            ref_px = self.ref_prices.get(msg.symbol, msg.price) or msg.price
             tkey = config.team_of(team_id) or team_id
             key_fn = lambda t: config.team_of(t) or t
             team_pos = sum(
@@ -860,68 +911,107 @@ class ExchangeServer:
             book = self.books.get(msg.symbol)
             open_buys = book.open_quantity(tkey, "buy", key_fn) if book else 0
             open_sells = book.open_quantity(tkey, "sell", key_fn) if book else 0
-            worst_team = (team_pos + open_buys + msg.quantity if msg.side == "buy"
-                          else team_pos - open_sells - msg.quantity)
-            if abs(worst_team) > limit:
+            worst_sym = (team_pos + open_buys + msg.quantity if msg.side == "buy"
+                         else team_pos - open_sells - msg.quantity)
+            # Post-trade gross notional: the current book with THIS symbol
+            # taken to its worst-case size (futures excluded, see
+            # Portfolio.gross_exposure).
+            if config.is_future(msg.symbol):
+                worst_gross = portfolio.gross_exposure(self.ref_prices)
+            else:
+                worst_gross = (portfolio.gross_exposure(self.ref_prices)
+                               - abs(portfolio.positions.get(msg.symbol, 0)) * ref_px
+                               + abs(worst_sym) * ref_px)
+            cap = max_lev * max(equity, 0.0)
+            if worst_gross > cap:
                 await self._reject(ws, team_id, ErrorMsg(
-                    code="POSITION_LIMIT",
+                    code="LEVERAGE_LIMIT",
                     message=(
-                        f"Order would take your team's {msg.symbol} exposure to "
-                        f"{worst_team:+d} counting resting orders (limit ±{limit})"
+                        f"Order would take gross exposure to ${worst_gross:,.2f}, "
+                        f"over your {max_lev:g}x leverage limit on ${equity:,.2f} "
+                        f"equity (max ${cap:,.2f})"
                     ),
                 ))
                 return
+        else:
+            # Per-symbol position limit — enforced at TEAM scope and counting
+            # RESTING orders (audit H2). Otherwise a team split the same risk
+            # across N seats (N× the cap) and one bot rested N sub-limit orders
+            # that all filled through the cap. Worst case: every same-side resting
+            # order for the team fills, plus this order.
+            limit = self.position_limit_for(team_id)
+            if limit > 0:
+                tkey = config.team_of(team_id) or team_id
+                key_fn = lambda t: config.team_of(t) or t
+                team_pos = sum(
+                    p.positions.get(msg.symbol, 0)
+                    for tid, p in self.portfolios.items()
+                    if (config.team_of(tid) or tid) == tkey)
+                book = self.books.get(msg.symbol)
+                open_buys = book.open_quantity(tkey, "buy", key_fn) if book else 0
+                open_sells = book.open_quantity(tkey, "sell", key_fn) if book else 0
+                worst_team = (team_pos + open_buys + msg.quantity if msg.side == "buy"
+                              else team_pos - open_sells - msg.quantity)
+                if abs(worst_team) > limit:
+                    await self._reject(ws, team_id, ErrorMsg(
+                        code="POSITION_LIMIT",
+                        message=(
+                            f"Order would take your team's {msg.symbol} exposure to "
+                            f"{worst_team:+d} counting resting orders (limit ±{limit})"
+                        ),
+                    ))
+                    return
 
-        if config.is_future(msg.symbol):
-            # Futures post margin, not notional, and the requirement is
-            # symmetric: a short contract ties up exactly as much as a long.
-            free_cash = portfolio.cash - portfolio.futures_margin()
-            needed = abs(worst_pos) * config.FUTURES_MARGIN_PER_CONTRACT \
-                - abs(cur) * config.FUTURES_MARGIN_PER_CONTRACT
-            if needed > 0 and free_cash < needed:
-                await self._reject(ws, team_id, ErrorMsg(
-                    code="INSUFFICIENT_MARGIN",
-                    message=(
-                        f"{msg.symbol} needs ${needed:,.2f} additional margin "
-                        f"(${config.FUTURES_MARGIN_PER_CONTRACT:,.2f} per "
-                        f"contract); you have ${free_cash:,.2f} free"
-                    ),
-                ))
-                return
-        elif msg.side == "buy":
-            # MOC ignores its price field and fills at the closing cross, so
-            # fund it at the mark like a market order — otherwise price=0
-            # defeats the buying-power check entirely (audit C6).
-            ref = (
-                msg.price if msg.order_type not in ("market", "moc")
-                else self.ref_prices.get(msg.symbol, msg.price)
-            )
-            worst_fee = (config.config_for_team(team_id, "taker_fee")
-                         if config.MAKER_TAKER_ENABLED
-                         else config.FEE_RATE / 2)
-            est_cost = ref * msg.quantity * (1.0 + worst_fee)
-
-            # Buying power: brokers may finance inventory on margin.
-            buying_power = portfolio.cash
-            if config.MARGIN_ENABLED and portfolio.role == "broker":
-                inv_mv = sum(
-                    q * self.ref_prices.get(s, 0.0)
-                    for s, q in portfolio.positions.items()
-                    if q > 0 and not config.is_future(s)
+            if config.is_future(msg.symbol):
+                # Futures post margin, not notional, and the requirement is
+                # symmetric: a short contract ties up exactly as much as a long.
+                free_cash = portfolio.cash - portfolio.futures_margin()
+                needed = abs(worst_pos) * config.FUTURES_MARGIN_PER_CONTRACT \
+                    - abs(cur) * config.FUTURES_MARGIN_PER_CONTRACT
+                if needed > 0 and free_cash < needed:
+                    await self._reject(ws, team_id, ErrorMsg(
+                        code="INSUFFICIENT_MARGIN",
+                        message=(
+                            f"{msg.symbol} needs ${needed:,.2f} additional margin "
+                            f"(${config.FUTURES_MARGIN_PER_CONTRACT:,.2f} per "
+                            f"contract); you have ${free_cash:,.2f} free"
+                        ),
+                    ))
+                    return
+            elif msg.side == "buy":
+                # MOC ignores its price field and fills at the closing cross, so
+                # fund it at the mark like a market order — otherwise price=0
+                # defeats the buying-power check entirely (audit C6).
+                ref = (
+                    msg.price if msg.order_type not in ("market", "moc")
+                    else self.ref_prices.get(msg.symbol, msg.price)
                 )
-                buying_power += (
-                    config.config_for_team(team_id, "margin_haircut") * inv_mv
-                )
+                worst_fee = (config.config_for_team(team_id, "taker_fee")
+                             if config.MAKER_TAKER_ENABLED
+                             else config.FEE_RATE / 2)
+                est_cost = ref * msg.quantity * (1.0 + worst_fee)
 
-            if buying_power < est_cost:
-                await self._reject(ws, team_id, ErrorMsg(
-                    code="INSUFFICIENT_CASH",
-                    message=(
-                        f"Estimated cost ${est_cost:,.2f}, "
-                        f"buying power ${buying_power:,.2f}"
-                    ),
-                ))
-                return
+                # Buying power: brokers may finance inventory on margin.
+                buying_power = portfolio.cash
+                if config.MARGIN_ENABLED and portfolio.role == "broker":
+                    inv_mv = sum(
+                        q * self.ref_prices.get(s, 0.0)
+                        for s, q in portfolio.positions.items()
+                        if q > 0 and not config.is_future(s)
+                    )
+                    buying_power += (
+                        config.config_for_team(team_id, "margin_haircut") * inv_mv
+                    )
+
+                if buying_power < est_cost:
+                    await self._reject(ws, team_id, ErrorMsg(
+                        code="INSUFFICIENT_CASH",
+                        message=(
+                            f"Estimated cost ${est_cost:,.2f}, "
+                            f"buying power ${buying_power:,.2f}"
+                        ),
+                    ))
+                    return
         # Sell orders may create short positions (market makers must be able
         # to post ask quotes before receiving fills). Shorts pay a per-tick
         # borrow fee and count against the position limit above — plus two
@@ -2377,6 +2467,25 @@ class ExchangeServer:
                 if p.role == "observer" or p.liquidated:
                     continue
                 nw = p.net_worth(self.ref_prices)
+                # Earned-leverage margin call & maintenance (opt-in). Below the
+                # call ratio a one-shot warning fires; below the tighter
+                # maintenance-margin ratio the team is liquidated, IN ADDITION
+                # to the existing net-worth trigger below.
+                if config.LEVERAGE_ENABLED:
+                    mr = p.margin_ratio(self.ref_prices)
+                    if mr < config.MARGIN_CALL_RATIO:
+                        if not p.margin_called:
+                            p.margin_called = True
+                            await self._margin_call(p, mr)
+                    elif p.margin_called:
+                        p.margin_called = False       # recovered above the ratio
+                    if mr < config.MAINTENANCE_MARGIN:
+                        if self.tick < p.shield_until_tick:
+                            continue
+                        if await self._try_risk_shield(p, nw):
+                            continue
+                        await self._liquidate(p, nw)
+                        continue
                 if nw >= p.starting_cash * config.MAINTENANCE_FRACTION:
                     continue
                 if self.tick < p.shield_until_tick:
@@ -2505,6 +2614,32 @@ class ExchangeServer:
         if ws:
             await self._send(ws, portfolio.to_message(self.ref_prices))
         return True
+
+    async def _margin_call(self, portfolio: Portfolio, mr: float) -> None:
+        """One-shot margin-call warning to a team under the earned-leverage
+        regime (config.LEVERAGE_ENABLED). Fires once when margin_ratio first
+        drops below MARGIN_CALL_RATIO; the latch clears on recovery."""
+        logger.warning("MARGIN CALL %s  margin_ratio=%.3f < %.3f",
+                       portfolio.team_id, mr, config.MARGIN_CALL_RATIO)
+        ev = SessionEvent(
+            event="MARGIN_CALL",
+            message=(
+                f"Margin call: your equity covers only {mr:.0%} of gross "
+                f"exposure (below {config.MARGIN_CALL_RATIO:.0%}). Reduce risk "
+                f"or you will be liquidated at {config.MAINTENANCE_MARGIN:.0%}."
+            ),
+            data={
+                "team_id": portfolio.team_id,
+                "margin_ratio": round(mr, 4),
+                "call_ratio": config.MARGIN_CALL_RATIO,
+                "maintenance_margin": config.MAINTENANCE_MARGIN,
+                "equity": round(portfolio.equity(self.ref_prices), 2),
+                "gross_exposure": round(portfolio.gross_exposure(self.ref_prices), 2),
+            },
+        )
+        ws = self.clients.get(portfolio.team_id)
+        if ws:
+            await self._send(ws, ev)
 
     async def _liquidate(self, portfolio: Portfolio, nw: float) -> None:
         """Force-flatten a team below maintenance: close every position at

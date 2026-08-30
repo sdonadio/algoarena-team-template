@@ -62,7 +62,10 @@ class Trader(ABC):
 
         `data` carries the specifics (e.g. CALENDAR → data["events"] lists
         upcoming events with tick and magnitude but never direction).
-        Default: nothing — but the best Level 5+ traders live here.
+        Under the earned-leverage regime you also receive "MARGIN_CALL" (your
+        equity has fallen below the call ratio — de-risk) and "LIQUIDATION"
+        (you were force-flattened). Default: nothing — but the best Level 5+
+        traders live here.
         """
 
     def on_ipo(self, symbol: str, lo: float, hi: float, shares: int,

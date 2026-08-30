@@ -136,6 +136,46 @@ LIQUIDATION_PENALTY  = float(os.environ.get("LIQUIDATION_PENALTY", "0.01"))   # 
 # the same book, and the policy is already spent.
 RISK_SHIELD_GRACE_TICKS = int(os.environ.get("RISK_SHIELD_GRACE_TICKS", "120"))
 
+# ── Earned leverage & margin tiers (opt-in) ──────────────────────────────────
+# When LEVERAGE_ENABLED, a team's buying power is governed by its EQUITY and a
+# per-level leverage multiple, instead of the flat share cap + cash-only
+# buying-power test. Higher unlock levels earn more leverage. Everything here
+# is INERT while the flag is False — the pre-trade path and the maintenance
+# loop keep their existing behaviour exactly, so the game plays as before.
+LEVERAGE_ENABLED = os.environ.get("LEVERAGE_ENABLED", "false").lower() in ("true", "1", "yes")
+
+_DEFAULT_LEVERAGE_BY_LEVEL: dict[int, float] = {1: 1.0, 2: 1.0, 3: 1.5, 4: 2.0, 5: 3.0, 6: 4.0}
+
+
+def _parse_leverage_by_level(raw: str | None) -> dict[int, float]:
+    """Parse "1:1.0,2:1.0,3:1.5,..." from the env, else the default table."""
+    if not raw:
+        return dict(_DEFAULT_LEVERAGE_BY_LEVEL)
+    out: dict[int, float] = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            lvl, mult = part.split(":")
+            out[int(lvl)] = float(mult)
+        except (ValueError, TypeError):
+            continue
+    return out or dict(_DEFAULT_LEVERAGE_BY_LEVEL)
+
+
+LEVERAGE_BY_LEVEL = _parse_leverage_by_level(os.environ.get("LEVERAGE_BY_LEVEL"))
+# Below this equity/gross ratio a team gets a one-shot margin-call warning.
+MARGIN_CALL_RATIO = float(os.environ.get("MARGIN_CALL_RATIO", "0.25"))
+# Below this equity/gross ratio the team is force-liquidated (leverage regime).
+MAINTENANCE_MARGIN = float(os.environ.get("MAINTENANCE_MARGIN", "0.20"))
+
+
+def leverage_for(level: int) -> float:
+    """Max gross-notional-to-equity multiple for a team at this unlock level."""
+    return LEVERAGE_BY_LEVEL.get(level, 1.0)
+
+
 # ── Conservative marking ────────────────────────────────────────────────────────
 # Mark longs at best bid and shorts at best ask (when a book exists) for net
 # worth and liquidation checks — the way real risk systems mark.

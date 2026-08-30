@@ -17,6 +17,9 @@ rich>=13.0,<16.0                # live leaderboard dashboard + shock tool consol
 # ── Course materials ──────────────────────────────────────────────────────────
 python-pptx>=0.6.23             # lecture deck builder (scripts/build_slides.py)
 
+# ── GenAI pair programmer ─────────────────────────────────────────────────────
+anthropic>=0.40                 # Claude SDK (Week-0 smoke test + GenAI dev workflow)
+
 # ── Strategy / analytics ──────────────────────────────────────────────────────
 numpy>=1.26,<3.0                # vectorised signal computation
 pandas>=2.0,<3.0                # OHLCV data wrangling in advanced strategies

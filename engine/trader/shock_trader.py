@@ -38,6 +38,7 @@ import websockets.exceptions
 from rich.console import Console
 
 import trader.config as config
+from shared.exchange_url import connect_line_once
 from shared.messages import (
     BookSnapshot,
     ErrorMsg,
@@ -309,6 +310,12 @@ class ShockTraderBot:
         self._session_open = False
 
     async def connect(self) -> None:
+        # Which venue, and where the address came from (a stale `.env` from
+        # `make register` points at the hosted arena). Once per venue, before
+        # the connect, so a retry loop cannot spam it.
+        line = connect_line_once(config.EXCHANGE_URL)
+        if line:
+            logger.info("%s", line)
         self._ws = await websockets.connect(config.EXCHANGE_URL)
         await self._ws.send(
             Handshake(team_id=config.TEAM_ID, role="trader", level=5,

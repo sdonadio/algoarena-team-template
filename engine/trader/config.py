@@ -11,14 +11,15 @@ Environment variables:
 import os
 
 from shared.envfile import load_env
+from shared.exchange_url import resolve_exchange_url
 
 load_env()  # .env from `make register` — shell variables still win
 
 TEAM_ID = os.environ.get("TEAM_ID", "trader_alpha")
-EXCHANGE_URL = os.environ.get("EXCHANGE_URL") or (
-    f"ws://{os.environ.get('EXCHANGE_HOST', 'localhost')}"
-    f":{os.environ.get('EXCHANGE_PORT', '8765')}"
-)
+# Resolved in one shared place, WITH its provenance: a stale EXCHANGE_HOST
+# left in `.env` by `make register` points at the hosted arena, and the bot
+# logs which of the three sources won when it connects.
+EXCHANGE_URL, EXCHANGE_URL_SOURCE = resolve_exchange_url()
 
 # Team token from registration (hosted deployments; empty for local play).
 ARENA_TOKEN = os.environ.get("ARENA_TOKEN", "")

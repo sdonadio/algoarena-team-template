@@ -19,6 +19,11 @@ AUTH_REQUIRED = os.environ.get("AUTH_REQUIRED", "false").lower() in ("true", "1"
 # session automatically on startup (nightly unattended-upgrades bounce the
 # service). Local play keeps the teacher's explicit START.
 SESSION_AUTOOPEN = os.environ.get("SESSION_AUTOOPEN", "false").lower() in ("true", "1", "yes")
+
+# List BTC-USD / ETH-USD alongside the equities (plugins/securities/crypto.py).
+# Off by default so the equity-only courses see no change; the Real-Time
+# Intelligent Systems week-5 lab turns it on for both venues and both brokers.
+CRYPTO_ENABLED = os.environ.get("CRYPTO_SECURITIES", "false").lower() in ("true", "1", "yes")
 FEE_RATE = float(os.environ.get("ARENA_FEE_RATE", "0.001"))
 # Minimum price increment (Reg NMS Rule 612: one penny). The book snaps
 # incoming prices toward the passive side. Ticks are what make queue
@@ -181,6 +186,17 @@ def leverage_for(level: int) -> float:
 # worth and liquidation checks — the way real risk systems mark.
 CONSERVATIVE_MARKS = os.environ.get("CONSERVATIVE_MARKS", "true").lower() in ("true", "1", "yes")
 
+# ── Disconnect handling ──────────────────────────────────────────────────────
+# When a participant's socket closes, pull every order it still has resting
+# off every book. Real venues do exactly this (a market maker's session drop
+# cancels its quotes) and without it a dead process leaves a bit-identical
+# two-sided book behind forever, so an abandoned market looks healthy and
+# students debug a phantom. Cancelling is NOT a fill: portfolios, cash, P&L
+# and season state are untouched. Observers and the teacher own no orders and
+# are never swept. Set false to keep orders resting across a disconnect.
+CANCEL_ON_DISCONNECT = os.environ.get(
+    "CANCEL_ON_DISCONNECT", "true").lower() in ("true", "1", "yes")
+
 # ── Session recording ───────────────────────────────────────────────────────────
 # Record every broadcast message to sessions/session_<ts>.jsonl between
 # SESSION_OPEN and SESSION_CLOSED. Replay with scripts/replay_session.py.
@@ -190,6 +206,11 @@ SESSIONS_DIR    = os.environ.get("SESSIONS_DIR", "sessions")
 # (trade_count, part_stats) are never trimmed, so trimming the log only
 # affects the "recent trades" view, not the leaderboard.
 TRADE_LOG_MAXLEN = int(os.environ.get("TRADE_LOG_MAXLEN", "20000"))
+# Hard ceiling on ONE session recording, in megabytes. A long hosted session
+# (or a runaway broadcast loop) would otherwise fill the disk; at the cap the
+# exchange stops writing, logs once at WARNING, and keeps trading. The file
+# already written stays on disk and replays fine.
+RECORD_MAX_MB = float(os.environ.get("RECORD_MAX_MB", "512"))
 
 # ── Per-team capital allocation ───────────────────────────────────────────────
 # Teams created with scripts/create_team.py choose how to invest their budget
@@ -562,6 +583,24 @@ FUTURES_MID_BLEND_WEIGHT = float(os.environ.get("FUTURES_MID_BLEND_WEIGHT", "0.0
 def is_future(symbol: str) -> bool:
     """True if this symbol settles as a cash-settled future."""
     return symbol in FUTURES
+
+
+CRYPTO_SYMBOLS: frozenset[str] = frozenset({"BTC-USD", "ETH-USD"})
+
+
+def is_crypto(symbol: str) -> bool:
+    """True for the opt-in crypto pairs (plugins/securities/crypto.py)."""
+    return symbol in CRYPTO_SYMBOLS
+
+
+def grants_starting_shares(symbol: str) -> bool:
+    """Does SESSION_OPEN hand every participant STARTING_SHARES of this symbol?
+
+    Equities: yes. Futures: no — they are contracts, not shares. Crypto: no —
+    20 BTC is $1.6M against a $100k starting balance, so a grant would dwarf
+    the cash and make every bot a whale; coins are bought, not issued.
+    """
+    return not (is_future(symbol) or is_crypto(symbol))
 
 
 # ── Starting inventory ────────────────────────────────────────────────────────

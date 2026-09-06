@@ -10,23 +10,22 @@ Environment variables:
 import os
 
 from shared.envfile import load_env
+from shared.exchange_url import exchange_urls, resolve_exchange_url
 
 load_env()  # .env from `make register` — shell variables still win
 
 TEAM_ID = os.environ.get("TEAM_ID", "broker_alpha")
 # EXCHANGE_URL: full URL override, e.g. wss://feed.arena.example.edu
 # (TLS-hosted play); otherwise built from EXCHANGE_HOST/EXCHANGE_PORT.
-EXCHANGE_URL = os.environ.get("EXCHANGE_URL") or (
-    f"ws://{os.environ.get('EXCHANGE_HOST', 'localhost')}"
-    f":{os.environ.get('EXCHANGE_PORT', '8765')}"
-)
+# Resolved in one shared place, WITH its provenance: a stale EXCHANGE_HOST
+# left in `.env` by `make register` points at the hosted arena, and the
+# broker logs which of the three sources won when it connects.
+EXCHANGE_URL, EXCHANGE_URL_SOURCE = resolve_exchange_url()
 
 # Multi-venue (Level 6): comma-separated list of exchange URLs to quote on
 # simultaneously. One BrokerBot instance runs per venue.
 #   EXCHANGE_URLS=ws://localhost:8765,ws://localhost:8766 python -m broker.broker
-EXCHANGE_URLS: list[str] = (
-    os.environ.get("EXCHANGE_URLS", EXCHANGE_URL).split(",")
-)
+EXCHANGE_URLS, EXCHANGE_URLS_SOURCE = exchange_urls()
 
 # Team token from registration (hosted deployments; empty for local play).
 ARENA_TOKEN = os.environ.get("ARENA_TOKEN", "")
@@ -34,6 +33,13 @@ ARENA_TOKEN = os.environ.get("ARENA_TOKEN", "")
 
 # Symbols to market-make. Must match what the exchange has registered.
 EQUITY_SYMBOLS: list[str] = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL", "META", "NFLX", "AMD", "INTC"]
+
+# Crypto pairs are quoted only when the exchange lists them (CRYPTO_SECURITIES=true
+# on both sides). Yahoo Finance serves BTC-USD / ETH-USD under these exact
+# symbols, 24/7, so the same polling feed works unchanged.
+CRYPTO_SYMBOLS: list[str] = ["BTC-USD", "ETH-USD"]
+if os.environ.get("CRYPTO_SECURITIES", "false").lower() in ("true", "1", "yes"):
+    EQUITY_SYMBOLS = EQUITY_SYMBOLS + CRYPTO_SYMBOLS
 
 # Yahoo Finance poll interval in seconds (yfinance has no WebSocket feed).
 YAHOO_POLL_INTERVAL: float = float(os.environ.get("YAHOO_POLL_INTERVAL", "5"))

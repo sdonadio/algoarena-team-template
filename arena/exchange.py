@@ -17,6 +17,7 @@ import websockets
 
 import exchange.config as _config
 from exchange.server import ExchangeServer, _print_startup
+from shared.exchange_url import bind_line_once
 from shared.messages import ErrorMsg, PlaceOrder, TradeExecution
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,13 @@ class Exchange:
                             format="%(asctime)s  %(levelname)-8s  %(message)s",
                             datefmt="%H:%M:%S")
         self._apply_fees()
+        # Say which address we bind and where it came from, once. A stale
+        # EXCHANGE_HOST in `.env` (written by `make register`, meant for
+        # CLIENTS) also lands in exchange.config.HOST, and binding a remote
+        # IP fails with a bare OSError that explains nothing.
+        line = bind_line_once(_config.HOST, _config.PORT)
+        if line:
+            logger.info("%s", line)
         try:
             asyncio.run(self._serve())
         except KeyboardInterrupt:

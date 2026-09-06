@@ -74,6 +74,7 @@ from rich.console import Console
 from rich.table import Table
 
 import trader.config as config
+from shared.exchange_url import connect_line_once
 from shared.messages import (
     BookSnapshot,
     ErrorMsg,
@@ -656,6 +657,14 @@ class TraderBot:
 
     async def connect(self) -> None:
         """Open a WebSocket to the exchange and send the Handshake."""
+        # Say which venue we are dialling and WHERE that address came from,
+        # once per venue — a stale EXCHANGE_HOST in `.env` (written by
+        # `make register`) otherwise sends a "local" bot to the hosted arena
+        # and the only symptom is a handshake timeout. Logged before
+        # connect() so the line is there even when the connect never returns.
+        line = connect_line_once(config.EXCHANGE_URL)
+        if line:
+            logger.info("%s", line)
         self._ws = await websockets.connect(config.EXCHANGE_URL)
         hs = Handshake(team_id=config.TEAM_ID, role="trader", level=1,
                        token=config.ARENA_TOKEN)

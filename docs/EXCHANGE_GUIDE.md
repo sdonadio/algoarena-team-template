@@ -46,6 +46,8 @@ Watch the logs — every connection, order, and fill is printed.
 | `FEE_RATE` | `0.001` | Flat fee (0.1% of notional) |
 | `SYMBOLS` | `["AAPL","TSLA","BTC"]` | Securities to list |
 | `INITIAL_CASH` | `100 000` | Starting cash per team |
+| `CANCEL_ON_DISCONNECT` | `true` | Pull a seat's resting orders off every book when its socket closes (a dead market maker stops leaving a phantom two-sided book). Never applies to observer/teacher connections, and never touches cash or P&L |
+| `RECORD_MAX_MB` | `512` | Size ceiling for one session recording. At the cap the exchange stops writing, logs once at WARNING, and keeps trading; the partial file stays on disk (`0` = uncapped) |
 
 ---
 

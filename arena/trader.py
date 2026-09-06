@@ -2,7 +2,11 @@
 arena.trader — derive Trader, implement on_tick(). That's the whole job.
 
 The plumbing underneath (trader/trader.py) connects, authenticates,
-tracks your portfolio, and calls your hooks at the right moments.
+tracks your portfolio, and calls your hooks at the right moments. Its
+first log line names the venue it dialled and where that address came
+from (shell, `.env`, or the built-in default) — read it before debugging
+a connection: `make register` leaves EXCHANGE_HOST=<hosted arena> in
+`.env`, so `EXCHANGE_HOST=localhost` is needed for local play.
 """
 
 from __future__ import annotations
@@ -202,6 +206,18 @@ class _SimPortfolioView:
 
     def net_worth(self, _prices: dict | None = None) -> float:
         return self._net_worth
+
+    # The same two pre-checks the live Portfolio exposes (trader/trader.py),
+    # so a bot written against on_tick()'s documented contract —
+    # .cash .positions .can_buy(s, qty, px) .can_sell(s, qty) — runs
+    # unchanged offline through as_signal_fn().
+    def can_buy(self, symbol: str, qty: int, price: float) -> bool:  # noqa: ARG002
+        """True if there is enough cash for qty at price (fee buffer included)."""
+        return self.cash >= price * qty * 1.001
+
+    def can_sell(self, symbol: str, qty: int) -> bool:
+        """True if at least qty shares of symbol are held (no short selling)."""
+        return self.positions.get(symbol, 0) >= qty
 
 
 def as_signal_fn(trader: "Trader"):

@@ -5,7 +5,10 @@ A market maker's whole job is three questions, and each is one method:
 how wide do I quote (spread), where do I centre it (skew), and who do I
 refuse to trade with (toxic). The plumbing underneath (broker/broker.py)
 handles the reference price feed, quote placement, cancel/replace, and
-multi-venue fan-out.
+multi-venue fan-out. It logs one line per venue naming the URL it dialled
+and where that address came from (shell, `.env`, or the built-in default)
+— `make register` leaves EXCHANGE_HOST=<hosted arena> in `.env`, so
+`EXCHANGE_HOST=localhost` is needed for local play.
 """
 
 from __future__ import annotations

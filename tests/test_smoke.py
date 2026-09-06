@@ -6,9 +6,15 @@ Run it:
 
 Six checks that prove your machine is ready for Week 1. Checks that need an
 external resource (your Anthropic key, the network, the class arena) SKIP —
-not fail — until you configure them, so `-v` shows you exactly what is left to
-set up. When everything is configured, all six are green; submit that
-screenshot to Canvas.
+not fail — until you configure them, so a student with no API key is not
+blocked. Read the skips carefully:
+
+    A SKIP IS NOT A GREEN CHECK. It means the check never ran.
+
+The run prints its own summary line ("4 passed, 2 skipped — a skip is NOT a
+green check") so there is no way to mistake a partly-configured machine for a
+finished one. Deliverable 1 is 6 passed, 0 skipped; that is the screenshot
+Canvas wants.
 """
 from __future__ import annotations
 
@@ -18,6 +24,97 @@ import os
 import sys
 
 import pytest
+
+from shared.messages import BookSnapshot, Handshake, parse_message
+
+# Number of checks in this file. Deliverable 1 is all of them PASSED.
+SMOKE_CHECKS = 6
+
+
+def smoke_handshake() -> Handshake:
+    """The handshake check 6 sends to the arena.
+
+    Built as a Pydantic model so it is validated before it hits the socket
+    and round-trips through parse_message() on the exchange side.
+    """
+    return Handshake(
+        team_id=os.environ.get("TEAM_ID", "smoke_check"),
+        role="observer",
+        level=1,
+        token=os.environ.get("ARENA_TOKEN", ""),
+    )
+
+
+def format_summary(passed: int, skipped: int, failed: int = 0) -> str:
+    """Render the end-of-run summary line for the Week-0 smoke test.
+
+    Skipped checks are the whole point of this wording: pytest prints them in
+    yellow next to the green dots, and students read "no failures" as "done".
+    They are not done — a skipped check never ran.
+
+    Args:
+        passed:  Checks that ran and passed.
+        skipped: Checks that were skipped (unconfigured resource).
+        failed:  Checks that ran and failed.
+
+    Returns:
+        A one-or-two-line string, ready to print.
+    """
+    head = f"Week-0 smoke test: {passed} passed, {skipped} skipped"
+    if failed:
+        head += f", {failed} FAILED"
+
+    if skipped or failed:
+        return (
+            f"{head} — a skip is NOT a green check.\n"
+            f"    {passed}/{SMOKE_CHECKS} checks actually ran green. "
+            f"Deliverable 1 needs {SMOKE_CHECKS}/{SMOKE_CHECKS}: read each "
+            f"SKIPPED line above, configure what it names, and run this again."
+        )
+    return (
+        f"{head} — all {SMOKE_CHECKS}/{SMOKE_CHECKS} checks ran green. "
+        f"Screenshot this for Canvas."
+    )
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _smoke_summary(request):
+    """Print format_summary() after the last check, skips included.
+
+    pytest's own tally ("4 passed, 2 skipped") is easy to misread as a pass,
+    so this restates it in words. Written defensively: a change in pytest's
+    internals must never make the smoke test itself fail.
+    """
+    yield
+    try:
+        reporter = request.config.pluginmanager.get_plugin("terminalreporter")
+        if reporter is None:
+            return
+        here = str(request.node.fspath)
+
+        def _count(outcome: str) -> int:
+            return sum(
+                1 for rep in reporter.stats.get(outcome, [])
+                if getattr(rep, "fspath", None)
+                and here.endswith(str(rep.fspath))
+            )
+
+        line = format_summary(_count("passed"), _count("skipped"),
+                              _count("failed"))
+        # Suspend pytest's capture so the line reaches the real terminal
+        # instead of the captured-output buffer of the last test.
+        capman = request.config.pluginmanager.get_plugin("capturemanager")
+        if capman is not None:
+            capman.suspend_global_capture(in_=True)
+        try:
+            reporter.write_line("")
+            for row in line.split("\n"):
+                reporter.write_line(row)
+        finally:
+            if capman is not None:
+                capman.resume_global_capture()
+    except Exception:  # noqa: BLE001 — a broken summary must not fail the run
+        pass
 
 
 def test_python_version():
@@ -76,11 +173,11 @@ def test_engine_and_sdk_smoke():
     _order, trades = ob.place_order("taker", "buy", 100.0, 5)
     assert trades and trades[0].price == 100.0
 
-    # SDK + engine end to end, no network required (tests/sim_session.py).
-    try:
-        from sim_session import SimSession          # tests/ is on the path under pytest
-    except ImportError:
-        from tests.sim_session import SimSession
+    # SDK + engine end to end, no network required (sim/session.py).
+    # `sim` is a real package, so this import cannot be shadowed by a
+    # third-party `tests` package the way `tests.sim_session` could.
+    from sim.session import SimSession
+
     result = SimSession().run(n_ticks=50, verbose=False)
     assert result is not None
 
@@ -89,7 +186,8 @@ def test_exchange_connection():
     """6. Bot connects to the exchange and market data flows.
 
     Set EXCHANGE_HOST (and EXCHANGE_PORT, default 8765) to the class arena to
-    run this; it connects, handshakes, and waits for a book snapshot.
+    run this; it connects, sends a shared.messages.Handshake, and waits
+    for a BookSnapshot.
     """
     host = os.environ.get("EXCHANGE_HOST")
     if not host:
@@ -100,15 +198,12 @@ def test_exchange_connection():
     async def _probe() -> bool:
         url = f"ws://{host}:{port}"
         async with websockets.connect(url) as ws:
-            await ws.send(json.dumps({
-                "type": "handshake",
-                "team_id": os.environ.get("TEAM_ID", "smoke_check"),
-                "role": "observer",
-                "level": 1,
-            }))
+            # Every message on the wire is a Pydantic model from
+            # shared/messages.py — never a hand-rolled dict (CLAUDE.md rule 1).
+            await ws.send(smoke_handshake().model_dump_json())
             for _ in range(60):
                 raw = await asyncio.wait_for(ws.recv(), timeout=5)
-                if json.loads(raw).get("type") == "book_snapshot":
+                if isinstance(parse_message(json.loads(raw)), BookSnapshot):
                     return True
         return False
 

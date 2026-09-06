@@ -784,17 +784,23 @@ experiments. See `plugins/securities/defaults.py` and docs/SEASON_GUIDE.md
 For a **mean-reverting** or **sine-wave** security, use `make_sine()`:
 
 ```python
-from plugins.securities.defaults import make_sine
+from plugins.securities.synthetic import make_sine
 
 arena.register_security(
     id="SYNTH",
-    name="Synthetic Sine",
+    name="Synthetic Sine Wave",
     asset_type="synthetic",
     base_price=100.00,
     color="#e879f9",
     price_fn=make_sine(base_price=100.0, amplitude=10.0, period=3600),
 )
 ```
+
+`SYNTH` ships pre-registered — importing `plugins.securities.synthetic` is
+enough, and `sim/session.py` does it for you. The price function is a pure
+sine-plus-drift curve with no RNG at all, so the path is identical in every
+process. Only the offline simulator loads the module: a live venue's tape has
+no `SYNTH`.
 
 ### New shock
 
@@ -891,7 +897,9 @@ All bots receive SESSION_CLOSED → flatten positions, stop trading
 
 ### Offline simulation (no network)
 
-`tests/sim_session.py` replicates the exchange in-process:
+`sim/session.py` replicates the exchange in-process (import it as
+`from sim.session import SimSession`; `tests/sim_session.py` is a re-export
+shim kept for older scripts):
 
 ```
 SimSession.run()

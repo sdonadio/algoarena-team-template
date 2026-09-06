@@ -183,7 +183,8 @@ greppable. That tape is the dataset for your feature pipelines, the input
 to `scripts/backtest.py` (replay your strategy against a recorded
 session), and the evidence everything is graded from. The offline
 simulator (`make sim`) needs no network at all — see
-[SIMULATOR_GUIDE](SIMULATOR_GUIDE.md) and `tests/sim_session.py`.
+[SIMULATOR_GUIDE](SIMULATOR_GUIDE.md) and `sim/session.py`
+(`from sim.session import SimSession`).
 
 **Q: Is my local engine copy the real market?**
 No — the hosted arena runs the teacher's engine; your copy exists so you

@@ -45,6 +45,7 @@ import websockets
 import websockets.exceptions
 
 import broker.config as config
+from shared.exchange_url import connect_line_once
 from shared.messages import (
     BookSnapshot,
     CancelOrder,
@@ -204,6 +205,14 @@ class BrokerBot:
 
     async def connect_to_exchange(self) -> None:
         """Open a WebSocket to the exchange and send the Handshake."""
+        # Say which venue we are dialling and WHERE that address came from,
+        # once per venue — a stale EXCHANGE_HOST in `.env` (written by
+        # `make register`) otherwise sends a "local" broker to the hosted
+        # arena and the only symptom is a handshake timeout. Logged before
+        # connect() so the line is there even when the connect never returns.
+        line = connect_line_once(self.exchange_url)
+        if line:
+            logger.info("%s", line)
         self._ws = await websockets.connect(self.exchange_url)
         hs = Handshake(team_id=config.TEAM_ID, role="broker", level=1,
                        token=config.ARENA_TOKEN)

@@ -19,6 +19,7 @@ python-pptx>=0.6.23             # lecture deck builder (scripts/build_slides.py)
 
 # ── GenAI pair programmer ─────────────────────────────────────────────────────
 anthropic>=0.40                 # Claude SDK (Week-0 smoke test + GenAI dev workflow)
+PyYAML>=6.0                     # ta_bot/config.yaml (teacher-only TA bot)
 
 # ── Strategy / analytics ──────────────────────────────────────────────────────
 numpy>=1.26,<3.0                # vectorised signal computation
@@ -27,3 +28,4 @@ pandas>=2.0,<3.0                # OHLCV data wrangling in advanced strategies
 # ── Testing ───────────────────────────────────────────────────────────────────
 pytest>=7.0,<11.0               # test runner
 pytest-asyncio>=0.23            # async test support (needed for WebSocket tests)
+ruff>=0.4                       # linter (HW 8 asks for a lint step in CI)

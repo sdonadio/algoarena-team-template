@@ -78,6 +78,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# How many price levels per side the disconnect sweep inspects when working
+# out which levels need a QueueUpdate. High enough to cover any real book;
+# the cancel itself is depth-independent (OrderBook.cancel_team_orders).
+_SWEEP_SCAN_LEVELS = 10_000
+
 
 def _new_part_stats() -> dict:
     """Empty cumulative activity record for one participant."""
@@ -371,6 +376,8 @@ class ExchangeServer:
         # Eagerly load default securities and shocks onto the global arena.
         import plugins.securities.defaults  # noqa: F401  (registers on import)
         import plugins.securities.futures   # noqa: F401  (ARENA-10, week 9)
+        if config.CRYPTO_ENABLED:
+            import plugins.securities.crypto  # noqa: F401  (BTC-USD/ETH-USD, opt-in)
         import plugins.shocks.defaults      # noqa: F401
         from plugins import arena
         self.registry = arena
@@ -490,6 +497,12 @@ class ExchangeServer:
         self.exchange_revenue: float = 0.0
         # Session recorder (JSONL file handle, active between open/close).
         self._recorder: Any = None
+        # Recording size guard (config.RECORD_MAX_MB): bytes written to the
+        # current file, its path for the one warning we emit, and whether the
+        # cap already fired (so the warning is logged once, not per frame).
+        self._record_bytes: int = 0
+        self._record_path: str | None = None
+        self._record_capped: bool = False
 
         # team_ids that authenticated as role="teacher"; allowed to send TeacherCommand.
         self.teacher_clients: set[str] = set()
@@ -550,6 +563,10 @@ class ExchangeServer:
     async def handle_client(self, websocket: Any) -> None:
         """Manage a single client from handshake through disconnect."""
         team_id: str | None = None
+        # The role this socket connected as. Kept in a local so the `finally`
+        # can tell a trading seat (whose resting orders must be swept on a
+        # disconnect) from an observer or the teacher (who own no orders).
+        conn_role: str = ""
         try:
             # ── Handshake (15 s timeout) ──────────────────────────────
             try:
@@ -585,6 +602,8 @@ class ExchangeServer:
                 logger.warning("Auth failed: %s (role=%s)", msg.team_id, msg.role)
                 return
 
+            conn_role = msg.role
+
             # Observers are admitted with any valid token (market-data access),
             # so their claimed team_id is untrusted — give them a unique,
             # non-colliding id so one can never occupy a real bot's or the
@@ -594,9 +613,16 @@ class ExchangeServer:
                 team_id = f"observer:{self._observer_seq}"
             else:
                 team_id = msg.team_id
-            if team_id in self.clients:
-                logger.info("Reconnect: %s", team_id)
+            reconnect = team_id in self.clients and self.clients[team_id] is not websocket
             self.clients[team_id] = websocket
+            if reconnect:
+                logger.info("Reconnect: %s", team_id)
+                # A reconnect must start clean. The dead socket's `finally`
+                # may not have run yet (TCP can take tens of seconds to
+                # notice), so sweep here too — the orders resting under this
+                # id predate this socket and nobody is minding them.
+                if self._sweeps_orders(conn_role, team_id):
+                    await self._cancel_resting_orders(team_id, reason="reconnect")
             self.ws_to_team[websocket] = team_id
 
             new_portfolio = False
@@ -663,7 +689,7 @@ class ExchangeServer:
                     portfolio = self.portfolios[team_id]
                     if n > 0:
                         for sym in self.books:
-                            if config.is_future(sym):
+                            if not config.grants_starting_shares(sym):
                                 continue
                             portfolio.positions[sym] = (
                                 portfolio.positions.get(sym, 0) + n)
@@ -742,11 +768,25 @@ class ExchangeServer:
             # Remove only what THIS socket owns (audit C7): popping by name let
             # any client evict the real dashboard by connecting+disconnecting
             # under its id.
+            was_teacher = websocket in self.teacher_ws
             self.teacher_ws.discard(websocket)
-            if team_id and self.clients.get(team_id) is websocket:
+            owned_slot = bool(team_id) and self.clients.get(team_id) is websocket
+            if owned_slot:
                 self.clients.pop(team_id, None)
                 self.teacher_clients.discard(team_id)
             self.ws_to_team.pop(websocket, None)
+            # Pull this seat's quotes out of every book (config.CANCEL_ON_DISCONNECT).
+            # Only when THIS socket still held the routing slot: a superseded
+            # duplicate socket closing must never wipe the live connection's
+            # orders (the reconnect path above already swept those).
+            if owned_slot and not was_teacher \
+                    and self._sweeps_orders(conn_role, team_id):
+                try:
+                    await self._cancel_resting_orders(team_id, reason="disconnect")
+                except websockets.exceptions.ConnectionClosed:
+                    pass    # another client died mid-broadcast; nothing to do
+                except Exception:
+                    logger.exception("Cancel-on-disconnect failed for %s", team_id)
             if team_id:
                 logger.info("Disconnected: %s", team_id)
 
@@ -1315,6 +1355,69 @@ class ExchangeServer:
                                        cancelled.price)
         await self._broadcast_ladder(cancelled.symbol)
 
+    def _sweeps_orders(self, conn_role: str, team_id: str | None) -> bool:
+        """Should this connection's resting orders be pulled when it goes away?
+
+        Only trading seats. Observers and the teacher never own orders, and a
+        teacher socket may legitimately carry a claimed team_id, so sweeping on
+        one would wipe a live bot's book (audit C7 shape). Role is checked from
+        the socket's own handshake, plus the namespaced observer id and the
+        teacher-id set as belt and braces.
+        """
+        if not config.CANCEL_ON_DISCONNECT or not team_id:
+            return False
+        if conn_role in ("observer", "teacher"):
+            return False
+        if team_id.startswith("observer:") or team_id in self.teacher_clients:
+            return False
+        return True
+
+    async def _cancel_resting_orders(self, team_id: str, reason: str) -> int:
+        """Pull every resting order owned by `team_id` off every book.
+
+        Same effect as the team cancelling each order itself: the orders leave
+        the books, queue standing is re-pushed to the owners left at each
+        vacated level, and the observer ladder is refreshed. Deliberately NOT
+        the same accounting — no cancellation fee and no order-to-trade
+        message credit, because the team sent no message; and never a fill, so
+        portfolios, cash, P&L and season state are untouched.
+
+        Returns the number of orders cancelled.
+        """
+        # Phase 1 — take the orders out of the books. No awaits: a cancelled
+        # connection task must not be able to leave half the books swept.
+        total = 0
+        vacated: dict[str, set[tuple[str, float]]] = {}
+        for symbol, book in list(self.books.items()):
+            # Which levels this team was resting at, so the bots left behind
+            # get a QueueUpdate. Read through the public book API before the
+            # cancel; the sweep itself is cancel_team_orders, which is
+            # depth-independent, so a team resting deeper than the scanned
+            # levels still loses every order.
+            levels: set[tuple[str, float]] = set()
+            snap = book.get_snapshot(depth=_SWEEP_SCAN_LEVELS)
+            for side, rows in (("buy", snap["bids"]), ("sell", snap["asks"])):
+                for price, _qty in rows:
+                    for order in book.orders_at(side, price):
+                        if order.team_id == team_id:
+                            levels.add((side, price))
+                            self._queue_cache.pop(order.order_id, None)
+            n = book.cancel_team_orders(team_id)
+            if not n:
+                continue
+            total += n
+            vacated[symbol] = levels
+
+        # Phase 2 — tell everyone else, exactly as a client cancel does.
+        for symbol, levels in vacated.items():
+            for side, price in sorted(levels):
+                await self._push_queue_updates(symbol, side, price)
+            await self._broadcast_ladder(symbol)
+        if total:
+            logger.info("Cancelled %d resting order(s) of %s on %s",
+                        total, team_id, reason)
+        return total
+
     async def _handle_teacher_command(
         self, ws: Any, msg: TeacherCommand, team_id: str
     ) -> None:
@@ -1569,7 +1672,7 @@ class ExchangeServer:
             n = config.starting_shares_for_bot(msg.bot_id)   # per-team divided (H1)
             if self.session_open and self._session_granted and n > 0:
                 for sym in self.books:
-                    if not config.is_future(sym):
+                    if config.grants_starting_shares(sym):
                         portfolio.positions[sym] = n
                         portfolio.avg_cost[sym] = self.ref_prices.get(sym, 0.0)
                         self.midsession_grants[sym] = (
@@ -2733,8 +2836,8 @@ class ExchangeServer:
             if n <= 0:
                 continue
             for sym in self.books:
-                # Futures are contracts, not shares — nothing to grant.
-                if config.is_future(sym):
+                # Futures are contracts and coins are bought, not issued.
+                if not config.grants_starting_shares(sym):
                     continue
                 portfolio.positions[sym] = portfolio.positions.get(sym, 0) + n
                 if sym not in portfolio.avg_cost:
@@ -4121,14 +4224,39 @@ class ExchangeServer:
     # ------------------------------------------------------------------
 
     def _record(self, payload: str) -> None:
-        """Append one broadcast message to the session recording (JSONL)."""
+        """Append one broadcast message to the session recording (JSONL).
+
+        Stops (once, at WARNING) when the file passes config.RECORD_MAX_MB - a
+        long hosted session must never fill the disk. Trading continues and the
+        partial file is left on disk: it replays fine.
+        """
         if self._recorder is None:
             return
+        line = f'{{"ts": {time.time():.3f}, "msg": {payload}}}\n'
         try:
-            self._recorder.write(f'{{"ts": {time.time():.3f}, "msg": {payload}}}\n')
+            self._recorder.write(line)
         except OSError as exc:
             logger.warning("Recording failed (%s) — disabled", exc)
-            self._recorder = None
+            self._stop_recording()
+            return
+        self._record_bytes += len(line.encode("utf-8", "replace"))
+        cap = self._record_cap_bytes()
+        if cap and self._record_bytes > cap and not self._record_capped:
+            self._record_capped = True      # log once, not once per frame
+            logger.warning(
+                "Session recording hit the %.0f MB cap (RECORD_MAX_MB) - "
+                "recording stopped: %s", config.RECORD_MAX_MB,
+                self._record_path or config.SESSIONS_DIR)
+            self._stop_recording()
+
+    @staticmethod
+    def _record_cap_bytes() -> int:
+        """config.RECORD_MAX_MB as a byte count (0 = uncapped)."""
+        try:
+            mb = float(config.RECORD_MAX_MB)
+        except (TypeError, ValueError):
+            return 0
+        return int(mb * 1024 * 1024) if mb > 0 else 0
 
     def _start_recording(self) -> None:
         if not config.RECORD_SESSIONS:
@@ -4137,6 +4265,9 @@ class ExchangeServer:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = os.path.join(config.SESSIONS_DIR, f"session_{stamp}.jsonl")
         self._recorder = open(path, "w")
+        self._record_bytes = 0
+        self._record_path = path
+        self._record_capped = False
         logger.info("Recording session → %s", path)
 
     def _stop_recording(self) -> None:

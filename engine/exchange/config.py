@@ -8,7 +8,21 @@ import os
 
 import shared.roster as roster_shape
 
-HOST = os.environ.get("EXCHANGE_HOST", "0.0.0.0")
+# Two different addresses, and conflating them was a real bug:
+#
+#   EXCHANGE_BIND  the address THIS SERVER BINDS (a local interface, or the
+#                  0.0.0.0 wildcard). Only the venue reads it.
+#   EXCHANGE_HOST  the address CLIENTS DIAL (see shared/exchange_url.py).
+#                  `make register` writes the hosted arena's public IP into
+#                  `.env` and shared/envfile.load_env() feeds it to every
+#                  process, so this is routinely an address that does NOT
+#                  exist on the student's laptop.
+#
+# HOST used to be the bind address too, so a registered student could not
+# start their own local venue at all: the bind failed with
+# "OSError: [Errno 49] Can't assign requested address" and nothing said why.
+BIND = os.environ.get("EXCHANGE_BIND", "0.0.0.0")
+HOST = os.environ.get("EXCHANGE_HOST", "localhost")
 PORT = int(os.environ.get("EXCHANGE_PORT", "8765"))
 
 # Require team tokens at handshake (hosted/AWS deployments). Local play

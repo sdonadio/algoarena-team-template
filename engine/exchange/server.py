@@ -69,6 +69,7 @@ from shared.messages import (
     UpgradeRequest,
     parse_message,
 )
+from shared.exchange_url import bind_line_once
 from shared.orderbook import OrderBook, Trade
 
 logging.basicConfig(
@@ -667,6 +668,15 @@ class ExchangeServer:
 
             # Send current leaderboard so dashboards see connected teams immediately.
             await self._send(websocket, self._build_leaderboard())
+
+            # The venue's fee schedule, at connect. It used to go out only on
+            # the teacher's `fee_schedule` command, so a bot that joined a
+            # running venue could not learn what it charges until a fill had
+            # already cost it money — and a cross-venue arbitrageur priced
+            # both legs off the ARB_TAKER_BPS assumption until then. A price
+            # list is public information; every role gets it.
+            await self._send(websocket,
+                             self._fee_schedule_event(config.refresh_venue_fees()))
 
             # Late joiners: bots gate all trading on the SESSION_OPEN event,
             # which is only broadcast at the moment the teacher opens. A bot
@@ -3748,6 +3758,32 @@ class ExchangeServer:
             },
         ))
 
+    def _fee_schedule_event(self, after: dict,
+                            before: dict | None = None) -> SessionEvent:
+        """The venue's price list, as the one FEE_SCHEDULE message.
+
+        Built in one place because it goes out on two paths: broadcast when
+        the schedule CHANGES (announce_fee_schedule), and sent to each client
+        at connect (handle_client), so a bot never has to discover the fee
+        from its own fills. `before` defaults to `after` — nothing changed,
+        this is just the current schedule.
+        """
+        was = before or after
+        return SessionEvent(
+            event="FEE_SCHEDULE",
+            message=(f"Venue fee schedule: taker "
+                     f"{after['taker'] * 10_000:.1f} bps, maker rebate "
+                     f"{after['rebate'] * 10_000:.1f} bps"),
+            data={
+                "port": config.PORT,
+                "taker": after["taker"],
+                "rebate": after["rebate"],
+                "net": round(after["taker"] - after["rebate"], 8),
+                "old": {"taker": was["taker"], "rebate": was["rebate"]},
+                "new": {"taker": after["taker"], "rebate": after["rebate"]},
+            },
+        )
+
     async def announce_fee_schedule(self, old: dict | None = None) -> None:
         """Re-read this venue's schedule and tell its clients about it.
 
@@ -3762,20 +3798,7 @@ class ExchangeServer:
         after = config.refresh_venue_fees(force=True)
         logger.info("Fee schedule → taker %.1f bps, rebate %.1f bps",
                     after["taker"] * 10_000, after["rebate"] * 10_000)
-        await self._broadcast(SessionEvent(
-            event="FEE_SCHEDULE",
-            message=(f"Venue fee schedule: taker "
-                     f"{after['taker'] * 10_000:.1f} bps, maker rebate "
-                     f"{after['rebate'] * 10_000:.1f} bps"),
-            data={
-                "port": config.PORT,
-                "taker": after["taker"],
-                "rebate": after["rebate"],
-                "net": round(after["taker"] - after["rebate"], 8),
-                "old": {"taker": before["taker"], "rebate": before["rebate"]},
-                "new": {"taker": after["taker"], "rebate": after["rebate"]},
-            },
-        ))
+        await self._broadcast(self._fee_schedule_event(after, before))
 
     async def set_fee_rate(self, rate: float) -> None:
         """Update the fee rate on all order books and notify clients."""
@@ -4292,6 +4315,16 @@ def _get_local_ip() -> str:
         return "127.0.0.1"
 
 
+def bind_target() -> tuple[str, int]:
+    """The (address, port) this venue binds — the one place that decides.
+
+    EXCHANGE_BIND (config.BIND, default 0.0.0.0), never EXCHANGE_HOST:
+    EXCHANGE_HOST is the address CLIENTS dial and `make register` leaves the
+    hosted arena's public IP there, which no student laptop can bind.
+    """
+    return config.BIND, config.PORT
+
+
 def _print_startup(server: ExchangeServer) -> None:
     local_ip = _get_local_ip()
     symbols = " ".join(server.books)
@@ -4301,7 +4334,8 @@ def _print_startup(server: ExchangeServer) -> None:
     print("=" * 62)
     print("         AlgoArena Exchange Server")
     print("=" * 62)
-    print(f"  WebSocket  : ws://{config.HOST}:{config.PORT}")
+    print(f"  Binding    : {config.BIND}:{config.PORT}   (EXCHANGE_BIND)")
+    print(f"  WebSocket  : ws://{config.HOST}:{config.PORT}   (EXCHANGE_HOST — what clients dial)")
     print(f"  Local IP   : ws://{local_ip}:{config.PORT}   ← share with students")
     print(f"  Fee rate   : {config.FEE_RATE:.4f}  ({config.FEE_RATE*100:.2f}%)")
     if config.MAKER_TAKER_ENABLED:
@@ -4343,7 +4377,17 @@ Teacher Commands
 async def main() -> None:
     server = ExchangeServer()
 
-    async with websockets.serve(server.handle_client, config.HOST, config.PORT):
+    # BIND, not HOST: EXCHANGE_HOST is where CLIENTS dial (routinely the
+    # hosted arena's public IP, left in `.env` by `make register`), and trying
+    # to bind that address is what stopped registered students from running
+    # their own local venue. See shared/exchange_url.bind_line_once.
+    bind_host, bind_port = bind_target()
+    line = bind_line_once(bind_host, bind_port)
+    if line:
+        logger.info("%s", line)
+    logger.info("Exchange binding %s:%s (clients dial ws://%s:%s)",
+                bind_host, bind_port, config.HOST, bind_port)
+    async with websockets.serve(server.handle_client, bind_host, bind_port):
         _print_startup(server)
 
         if config.SESSION_AUTOOPEN:

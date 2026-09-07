@@ -16,7 +16,7 @@ import logging
 import websockets
 
 import exchange.config as _config
-from exchange.server import ExchangeServer, _print_startup
+from exchange.server import ExchangeServer, _print_startup, bind_target
 from shared.exchange_url import bind_line_once
 from shared.messages import ErrorMsg, PlaceOrder, TradeExecution
 
@@ -80,11 +80,12 @@ class Exchange:
                             format="%(asctime)s  %(levelname)-8s  %(message)s",
                             datefmt="%H:%M:%S")
         self._apply_fees()
-        # Say which address we bind and where it came from, once. A stale
-        # EXCHANGE_HOST in `.env` (written by `make register`, meant for
-        # CLIENTS) also lands in exchange.config.HOST, and binding a remote
-        # IP fails with a bare OSError that explains nothing.
-        line = bind_line_once(_config.HOST, _config.PORT)
+        # Say which address we bind and where it came from, once. The bind
+        # address is EXCHANGE_BIND (default 0.0.0.0) and NOT EXCHANGE_HOST:
+        # `make register` leaves the hosted arena's public IP in `.env` for
+        # CLIENTS to dial, and binding a remote IP fails with a bare OSError
+        # that explains nothing.
+        line = bind_line_once(*bind_target())
         if line:
             logger.info("%s", line)
         try:
@@ -111,8 +112,7 @@ class Exchange:
 
     async def _serve(self) -> None:
         server = _AdaptedExchangeServer(self)
-        async with websockets.serve(server.handle_client,
-                                    _config.HOST, _config.PORT):
+        async with websockets.serve(server.handle_client, *bind_target()):
             _print_startup(server)
             try:
                 await asyncio.gather(

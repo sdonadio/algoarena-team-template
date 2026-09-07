@@ -167,30 +167,47 @@ def connect_line_once(url: str | None = None,
     return format_connect_line(resolved, source)
 
 
+#: The env var that names the address a VENUE binds. Deliberately NOT
+#: EXCHANGE_HOST — that one is the address clients dial.
+BIND_KEY = "EXCHANGE_BIND"
+
 #: Addresses a process can actually bind on any machine.
 LOCAL_BIND_HOSTS = ("0.0.0.0", "::", "localhost", "127.0.0.1", "::1", "")
+
+
+#: What to tell a student whose venue cannot bind the address it was given.
+BIND_HINT = f"set {BIND_KEY}=0.0.0.0 (or unset it) to bind every interface"
 
 
 def bind_line_once(host: str, port: int | str) -> str | None:
     """The line a VENUE logs once: which address it binds, and its source.
 
     The mirror image of the client problem, and the nastier half of it:
-    `exchange/config.HOST` also reads ``EXCHANGE_HOST`` (default 0.0.0.0), so
-    a stale `.env` holding the hosted arena's IP makes a student's own
-    exchange try to bind an address that does not exist on their laptop. The
-    raw symptom is ``OSError: [Errno 49] Can't assign requested address``.
+    ``exchange/config.HOST`` used to be the BIND address as well as the
+    client-facing one, so a stale `.env` holding the hosted arena's IP made a
+    student's own exchange try to bind an address that does not exist on their
+    laptop — ``OSError: [Errno 49] Can't assign requested address``. The bind
+    address is now its own variable, ``EXCHANGE_BIND`` (default 0.0.0.0), and
+    this line names whichever variable actually produced `host`.
     """
     key = f"bind:{host}:{port}"
     if key in _announced:
         return None
     _announced.add(key)
-    source = (_label("EXCHANGE_HOST") if os.environ.get("EXCHANGE_HOST")
-              else SOURCE_DEFAULT)
+    host_env = (os.environ.get("EXCHANGE_HOST") or "").strip()
+    if os.environ.get(BIND_KEY):
+        source = _label(BIND_KEY)
+    elif host_env and str(host) == host_env:
+        # A caller still passing EXCHANGE_HOST as the bind address (or a
+        # venue explicitly told to bind it) — name the variable it came from.
+        source = _label("EXCHANGE_HOST")
+    else:
+        source = SOURCE_DEFAULT
     line = f"Serving on {host}:{port} ({source})"
     if str(host) not in LOCAL_BIND_HOSTS:
         line += (f" — {host} is not an address this machine can bind; "
-                 f"EXCHANGE_HOST only tells CLIENTS where to dial, so unset "
-                 f"it (or {LOCAL_HINT}) if the bind fails")
+                 f"EXCHANGE_HOST only tells CLIENTS where to dial, so "
+                 f"{BIND_HINT} ({LOCAL_HINT})")
     return line
 
 

@@ -5,11 +5,15 @@ Run it:
     python -m pytest tests/test_smoke.py -v
 
 Six checks that prove your machine is ready for Week 1. Checks that need an
-external resource (your Anthropic key, the network, the class arena) SKIP —
-not fail — until you configure them, so a student with no API key is not
-blocked. Read the skips carefully:
+external resource (the network, the class arena) SKIP — not fail — until you
+configure them. Read the skips carefully:
 
     A SKIP IS NOT A GREEN CHECK. It means the check never ran.
+
+Check 3 (generative AI) is OPTIONAL. Use any provider you like (Anthropic,
+OpenAI, Gemini, ...) or none at all; nothing graded depends on it. With no
+provider key set, check 3 PASSES and says so. With a key set, it verifies that
+provider actually answers, so a broken key is caught now and not in Week 3.
 
 The run prints its own summary line ("4 passed, 2 skipped — a skip is NOT a
 green check") so there is no way to mistake a partly-configured machine for a
@@ -132,21 +136,71 @@ def test_arena_sdk_imports():
     assert Trader is not None
 
 
-def test_anthropic_key_and_response():
-    """3. ANTHROPIC_API_KEY set — Claude responds to a test prompt."""
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        pytest.skip("set ANTHROPIC_API_KEY (and `pip install anthropic`) to run the Claude check")
-    anthropic = pytest.importorskip("anthropic", reason="run `pip install anthropic`")
-    try:
-        client = anthropic.Anthropic()
-        resp = client.messages.create(
-            model="claude-3-5-haiku-latest",
-            max_tokens=8,
-            messages=[{"role": "user", "content": "Reply with the single word OK."}],
-        )
-    except Exception as exc:  # noqa: BLE001 — surface the real reason to the student
-        pytest.skip(f"ANTHROPIC_API_KEY is set but Claude did not respond ({exc}) — check the key/network")
-    assert resp.content, "Claude returned an empty response"
+def _ai_ping(provider: str) -> str:
+    """Send one tiny prompt to `provider` and return its text reply.
+
+    Args:
+        provider: "anthropic", "openai" or "gemini" (chosen from the env key).
+
+    Returns:
+        The model's reply text (may be empty if the provider returned nothing).
+    """
+    prompt = "Reply with the single word OK."
+    if provider == "anthropic":
+        import anthropic
+        resp = anthropic.Anthropic().messages.create(
+            model=os.environ.get("AI_SMOKE_MODEL", "claude-haiku-4-5"),
+            max_tokens=8, messages=[{"role": "user", "content": prompt}])
+        return "".join(getattr(b, "text", "") for b in resp.content)
+    if provider == "openai":
+        import openai
+        resp = openai.OpenAI().chat.completions.create(
+            model=os.environ.get("AI_SMOKE_MODEL", "gpt-4o-mini"),
+            max_tokens=8, messages=[{"role": "user", "content": prompt}])
+        return resp.choices[0].message.content or ""
+    from google import genai  # provider == "gemini"
+    key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    resp = genai.Client(api_key=key).models.generate_content(
+        model=os.environ.get("AI_SMOKE_MODEL", "gemini-2.0-flash"), contents=prompt)
+    return resp.text or ""
+
+
+# provider -> (env vars that select it, pip package, import name)
+_AI_PROVIDERS = {
+    "anthropic": (("ANTHROPIC_API_KEY",), "anthropic", "anthropic"),
+    "openai":    (("OPENAI_API_KEY",), "openai", "openai"),
+    "gemini":    (("GEMINI_API_KEY", "GOOGLE_API_KEY"), "google-genai", "google.genai"),
+}
+
+
+def test_ai_provider_optional():
+    """3. Generative AI is OPTIONAL — if you configured a provider, it answers.
+
+    No key set: PASS (AI is not required in this course). A key set for
+    Anthropic, OpenAI or Gemini: the provider must answer a one-word prompt.
+    To opt out after setting a key, unset it and run again.
+    """
+    import importlib.util
+
+    chosen = [name for name, (envs, _, _) in _AI_PROVIDERS.items()
+              if any(os.environ.get(e) for e in envs)]
+    if not chosen:
+        print("\n    check 3: no AI provider key set — fine, generative AI is optional "
+              "in this course (any provider, or none).")
+        return
+    for name in chosen:
+        envs, pkg, mod = _AI_PROVIDERS[name]
+        if importlib.util.find_spec(mod.split(".")[0]) is None or (
+                "." in mod and importlib.util.find_spec(mod) is None):
+            pytest.fail(f"{envs[0]} is set but `{pkg}` is not installed: "
+                        f"`pip install {pkg}`, or unset {envs[0]} to opt out of AI")
+        try:
+            reply = _ai_ping(name)
+        except Exception as exc:  # noqa: BLE001 — surface the real reason to the student
+            pytest.fail(f"{envs[0]} is set but {name} did not answer ({exc}). "
+                        f"Fix the key/network, or unset {envs[0]} to opt out of AI.")
+        assert reply.strip(), f"{name} returned an empty reply"
+        print(f"\n    check 3: {name} answered: {reply.strip()[:20]!r}")
 
 
 def test_yfinance_live_price():

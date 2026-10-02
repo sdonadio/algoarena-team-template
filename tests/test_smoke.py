@@ -239,18 +239,20 @@ def test_engine_and_sdk_smoke():
 def test_exchange_connection():
     """6. Bot connects to the exchange and market data flows.
 
-    Set EXCHANGE_HOST (and EXCHANGE_PORT, default 8765) to the class arena to
-    run this; it connects, sends a shared.messages.Handshake, and waits
-    for a BookSnapshot.
+    Dials the same URL your bot uses: EXCHANGE_URL (e.g. the hosted
+    wss://feed.… address `make register` wrote to .env), else
+    EXCHANGE_HOST + EXCHANGE_PORT. It connects, sends a
+    shared.messages.Handshake, and waits for a BookSnapshot.
     """
-    host = os.environ.get("EXCHANGE_HOST")
-    if not host:
-        pytest.skip("set EXCHANGE_HOST / EXCHANGE_PORT to the class arena to run the live connect check")
-    port = os.environ.get("EXCHANGE_PORT", "8765")
+    from shared.exchange_url import SOURCE_DEFAULT, resolve_exchange_url
+
+    url, source = resolve_exchange_url()
+    if source == SOURCE_DEFAULT:
+        pytest.skip("set EXCHANGE_URL (or EXCHANGE_HOST / EXCHANGE_PORT) to the class arena "
+                    "— `make register` writes it to .env — to run the live connect check")
     websockets = pytest.importorskip("websockets")
 
     async def _probe() -> bool:
-        url = f"ws://{host}:{port}"
         async with websockets.connect(url) as ws:
             # Every message on the wire is a Pydantic model from
             # shared/messages.py — never a hand-rolled dict (CLAUDE.md rule 1).
@@ -264,5 +266,5 @@ def test_exchange_connection():
     try:
         ok = asyncio.run(asyncio.wait_for(_probe(), timeout=20))
     except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"EXCHANGE_HOST is set but couldn't reach the arena at {host}:{port} ({exc}) — check the URL/token")
+        pytest.skip(f"couldn't reach the arena at {url} ({source}): {exc} — check the URL/token")
     assert ok, "connected to the arena but no market data arrived"

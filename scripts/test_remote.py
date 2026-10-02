@@ -28,6 +28,7 @@ of the wire protocol (see docs/QUICKSTART.md and shared/messages.py).
 from __future__ import annotations
 
 import argparse
+import os
 import asyncio
 import json
 import pathlib
@@ -87,10 +88,31 @@ async def recv_type(ws, wanted: str, timeout: float = 10.0):
     return None
 
 
+def _exchange_url(args: argparse.Namespace, arena: str, ws_host: str) -> str:
+    """The exchange URL to dial: the one your bot uses, when we can know it.
+
+    Order: --ws-url; EXCHANGE_URL (shell or .env, as written by `make
+    register`); for an https:// arena the hosted TLS feed wss://feed.<host>
+    (port 8765 is not exposed there); else ws://<host>:<port> for a plain venue.
+    """
+    if args.ws_url:
+        return args.ws_url
+    try:
+        from shared.exchange_url import resolve_exchange_url
+        url, _ = resolve_exchange_url()
+        if os.environ.get("EXCHANGE_URL"):
+            return url
+    except Exception:  # noqa: BLE001 — fall back to the derived URL
+        pass
+    if arena.startswith("https://"):
+        return f"wss://feed.{ws_host}"
+    return f"ws://{ws_host}:{args.port}"
+
+
 async def run(args: argparse.Namespace) -> int:
     arena = args.arena.rstrip("/")
-    ws_host = arena.split("//")[-1].split(":")[0]
-    ws_url = f"ws://{ws_host}:{args.port}"
+    ws_host = arena.split("//")[-1].split(":")[0].split("/")[0]
+    ws_url = _exchange_url(args, arena, ws_host)
 
     print(f"\nTesting arena {arena}  (exchange {ws_url})\n")
 
@@ -198,6 +220,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Test your connection to a hosted arena")
     ap.add_argument("--arena", required=True, help="dashboard URL, e.g. http://host:8888")
     ap.add_argument("--port", type=int, default=8765, help="exchange port (default 8765)")
+    ap.add_argument("--ws-url", default="", help="exchange URL to dial (default: EXCHANGE_URL, "
+                    "or wss://feed.<host> for an https:// arena)")
     ap.add_argument("--code", help="class registration code (creates a throwaway team)")
     ap.add_argument("--token", help="your team token (skips registration)")
     ap.add_argument("--broker", help="your broker bot id (with --token)")

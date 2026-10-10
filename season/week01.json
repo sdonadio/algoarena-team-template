@@ -1,0 +1,24 @@
+{
+  "week": 1,
+  "label": "Paper trading \u2014 connect, place orders; long-only, nothing counts",
+  "flags": {
+    "shorts_allowed": false,
+    "post_only_allowed": false,
+    "circuit_breakers": false,
+    "cancellation_fees": false,
+    "latency_enabled": false,
+    "multi_venue": true,
+    "futures_enabled": false,
+    "purchase_window": false
+  },
+  "position_limit": 200,
+  "scoring_counts": false,
+  "config": {
+    "OPENING_AUCTION_TICKS": 0,
+    "CLOSING_AUCTION": false,
+    "SSR_TRIGGER_PCT": 0,
+    "SHORT_LOCATE_CAP": 0,
+    "LULD_BAND_PCT": 0.15
+  },
+  "events": []
+}

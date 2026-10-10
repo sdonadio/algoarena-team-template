@@ -1,0 +1,75 @@
+{
+  "week": 6,
+  "label": "Scenario tournament — the whole market at once",
+  "flags": {
+    "shorts_allowed": true,
+    "post_only_allowed": true,
+    "circuit_breakers": true,
+    "cancellation_fees": false,
+    "latency_enabled": false,
+    "multi_venue": true,
+    "futures_enabled": false,
+    "purchase_window": false
+  },
+  "position_limit": 1000,
+  "maintenance_fraction": 0.4,
+  "scoring_counts": true,
+  "config": {
+    "OPENING_AUCTION_TICKS": 12,
+    "CLOSING_AUCTION": true,
+    "CLOSING_AUCTION_TICKS": 10,
+    "SSR_TRIGGER_PCT": 0.06,
+    "SHORT_LOCATE_CAP": 2000,
+    "LULD_BAND_PCT": 0.08
+  },
+  "events": [
+    {
+      "kind": "earnings",
+      "tick": 250,
+      "symbol": "INTC",
+      "magnitude_range": [
+        0.03,
+        0.08
+      ]
+    },
+    {
+      "kind": "ipo",
+      "symbol": "VLTA",
+      "name": "Volta Grid",
+      "offer_range": [
+        30.0,
+        34.0
+      ],
+      "shares": 3500,
+      "window": [
+        150,
+        420
+      ],
+      "tick": 520
+    },
+    {
+      "kind": "earnings",
+      "tick": 600,
+      "symbol": "MSFT",
+      "magnitude_range": [
+        0.03,
+        0.07
+      ]
+    },
+    {
+      "kind": "dividend",
+      "tick": 800,
+      "symbol": "NVDA",
+      "amount_per_share": 0.3
+    },
+    {
+      "kind": "econ_print",
+      "tick": 950,
+      "magnitude_range": [
+        0.015,
+        0.03
+      ],
+      "market_wide": true
+    }
+  ]
+}

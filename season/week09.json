@@ -1,0 +1,51 @@
+{
+  "week": 9,
+  "label": "ARENA-10 futures \u2014 margin, basis, and scarce borrow",
+  "flags": {
+    "shorts_allowed": true,
+    "post_only_allowed": true,
+    "circuit_breakers": true,
+    "cancellation_fees": true,
+    "latency_enabled": true,
+    "multi_venue": true,
+    "futures_enabled": true,
+    "purchase_window": false
+  },
+  "position_limit": 1000,
+  "order_quota": 10,
+  "scoring_counts": true,
+  "config": {
+    "OPENING_AUCTION_TICKS": 12,
+    "CLOSING_AUCTION": true,
+    "CLOSING_AUCTION_TICKS": 10,
+    "SSR_TRIGGER_PCT": 0.08,
+    "SHORT_LOCATE_CAP": 800,
+    "LULD_BAND_PCT": 0.08
+  },
+  "events": [
+    {
+      "kind": "dividend",
+      "tick": 500,
+      "symbol": "MSFT",
+      "amount_per_share": 0.4
+    },
+    {
+      "kind": "econ_print",
+      "tick": 350,
+      "magnitude_range": [
+        0.02,
+        0.05
+      ],
+      "market_wide": true
+    },
+    {
+      "kind": "earnings",
+      "tick": 700,
+      "symbol": "NVDA",
+      "magnitude_range": [
+        0.04,
+        0.1
+      ]
+    }
+  ]
+}

@@ -65,7 +65,8 @@ dashboard.
 
 - `team/trader.py` → `MyTrader.on_tick()` — your edge
 - `team/broker.py` → quoting + inventory management (Level 4 keeps you solvent)
-- Test offline, no network needed: `make sim` and `make test`
+- Test offline, no network needed: `make sim`, `make season WEEK=3` (that week's rules and event calendar, from `season/week03.json`) and `make test`
+- Replay a Friday recording (posted in the Canvas module after class): put it in `sessions/`, run `make replay FILE=sessions/<file>` in one terminal (it serves the tape as a local exchange on port 8765), and in another run your bot against it with `EXCHANGE_HOST=localhost make trader BOT=<id>` to watch how it behaves through the block's events. The live dashboard is on the hosted venue only.
 
 **Full connection guide (read this first): [docs/CONNECTING.md](docs/CONNECTING.md)**
 

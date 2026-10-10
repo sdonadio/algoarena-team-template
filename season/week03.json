@@ -1,0 +1,43 @@
+{
+  "week": 3,
+  "label": "Signals & earnings \u2014 long-only, the wire under load",
+  "flags": {
+    "shorts_allowed": false,
+    "post_only_allowed": false,
+    "circuit_breakers": false,
+    "cancellation_fees": false,
+    "latency_enabled": false,
+    "multi_venue": true,
+    "futures_enabled": false,
+    "purchase_window": false
+  },
+  "position_limit": 600,
+  "scoring_counts": true,
+  "config": {
+    "OPENING_AUCTION_TICKS": 0,
+    "CLOSING_AUCTION": false,
+    "SSR_TRIGGER_PCT": 0,
+    "SHORT_LOCATE_CAP": 0,
+    "LULD_BAND_PCT": 0.1
+  },
+  "events": [
+    {
+      "kind": "earnings",
+      "tick": 300,
+      "symbol": "NVDA",
+      "magnitude_range": [
+        0.03,
+        0.08
+      ]
+    },
+    {
+      "kind": "earnings",
+      "tick": 700,
+      "symbol": "TSLA",
+      "magnitude_range": [
+        0.04,
+        0.09
+      ]
+    }
+  ]
+}

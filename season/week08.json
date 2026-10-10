@@ -1,0 +1,69 @@
+{
+  "week": 8,
+  "label": "Multi-venue \u2014 NBBO routing, fee wars, the LUNA IPO",
+  "flags": {
+    "shorts_allowed": true,
+    "post_only_allowed": true,
+    "circuit_breakers": true,
+    "cancellation_fees": true,
+    "latency_enabled": true,
+    "multi_venue": true,
+    "futures_enabled": false,
+    "purchase_window": false
+  },
+  "position_limit": 1000,
+  "order_quota": 8,
+  "scoring_counts": true,
+  "config": {
+    "OPENING_AUCTION_TICKS": 12,
+    "CLOSING_AUCTION": true,
+    "CLOSING_AUCTION_TICKS": 10,
+    "SSR_TRIGGER_PCT": 0.08,
+    "SHORT_LOCATE_CAP": 1000,
+    "LULD_BAND_PCT": 0.08
+  },
+  "events": [
+    {
+      "kind": "earnings",
+      "tick": 300,
+      "symbol": "GOOGL",
+      "magnitude_range": [
+        0.03,
+        0.08
+      ]
+    },
+    {
+      "kind": "earnings",
+      "tick": 700,
+      "symbol": "NFLX",
+      "magnitude_range": [
+        0.04,
+        0.09
+      ]
+    },
+    {
+      "kind": "econ_print",
+      "tick": 1000,
+      "magnitude_range": [
+        0.015,
+        0.03
+      ],
+      "market_wide": true
+    },
+    {
+      "kind": "ipo",
+      "symbol": "LUNA",
+      "name": "Luna Robotics",
+      "offer_range": [
+        45.0,
+        52.0
+      ],
+      "shares": 3000,
+      "window": [
+        150,
+        450
+      ],
+      "tick": 550
+    }
+  ]
+}

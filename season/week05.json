@@ -1,0 +1,53 @@
+{
+  "week": 5,
+  "label": "Risk \u2014 breakers, stops and liquidation live",
+  "flags": {
+    "shorts_allowed": true,
+    "post_only_allowed": true,
+    "circuit_breakers": true,
+    "cancellation_fees": false,
+    "latency_enabled": false,
+    "multi_venue": true,
+    "futures_enabled": false,
+    "purchase_window": false
+  },
+  "position_limit": 800,
+  "maintenance_fraction": 0.5,
+  "scoring_counts": true,
+  "config": {
+    "OPENING_AUCTION_TICKS": 12,
+    "CLOSING_AUCTION": false,
+    "SSR_TRIGGER_PCT": 0.06,
+    "SHORT_LOCATE_CAP": 2000,
+    "LULD_BAND_PCT": 0.08
+  },
+  "events": [
+    {
+      "kind": "earnings",
+      "tick": 300,
+      "symbol": "NFLX",
+      "magnitude_range": [
+        0.06,
+        0.12
+      ]
+    },
+    {
+      "kind": "earnings",
+      "tick": 750,
+      "symbol": "AMD",
+      "magnitude_range": [
+        0.05,
+        0.1
+      ]
+    },
+    {
+      "kind": "econ_print",
+      "tick": 1050,
+      "magnitude_range": [
+        0.03,
+        0.05
+      ],
+      "market_wide": true
+    }
+  ]
+}

@@ -1,0 +1,34 @@
+{
+  "week": 2,
+  "label": "Season scoring begins \u2014 long-only while you master async",
+  "flags": {
+    "shorts_allowed": false,
+    "post_only_allowed": false,
+    "circuit_breakers": false,
+    "cancellation_fees": false,
+    "latency_enabled": false,
+    "multi_venue": true,
+    "futures_enabled": false,
+    "purchase_window": false
+  },
+  "position_limit": 400,
+  "scoring_counts": true,
+  "config": {
+    "OPENING_AUCTION_TICKS": 0,
+    "CLOSING_AUCTION": false,
+    "SSR_TRIGGER_PCT": 0,
+    "SHORT_LOCATE_CAP": 0,
+    "LULD_BAND_PCT": 0.1
+  },
+  "events": [
+    {
+      "kind": "earnings",
+      "tick": 400,
+      "symbol": "AAPL",
+      "magnitude_range": [
+        0.03,
+        0.08
+      ]
+    }
+  ]
+}

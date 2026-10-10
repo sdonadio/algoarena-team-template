@@ -1,0 +1,60 @@
+{
+  "week": 7,
+  "label": "Execution \u2014 quotas, latency, cancel fees; borrow tightens; window 2",
+  "flags": {
+    "shorts_allowed": true,
+    "post_only_allowed": true,
+    "circuit_breakers": true,
+    "cancellation_fees": true,
+    "latency_enabled": true,
+    "multi_venue": true,
+    "futures_enabled": false,
+    "purchase_window": true
+  },
+  "position_limit": 1000,
+  "order_quota": 8,
+  "scoring_counts": true,
+  "config": {
+    "OPENING_AUCTION_TICKS": 12,
+    "CLOSING_AUCTION": true,
+    "CLOSING_AUCTION_TICKS": 10,
+    "SSR_TRIGGER_PCT": 0.08,
+    "SHORT_LOCATE_CAP": 1200,
+    "LULD_BAND_PCT": 0.08
+  },
+  "events": [
+    {
+      "kind": "earnings",
+      "tick": 400,
+      "symbol": "TSLA",
+      "magnitude_range": [
+        0.05,
+        0.1
+      ]
+    },
+    {
+      "kind": "earnings",
+      "tick": 900,
+      "symbol": "AAPL",
+      "magnitude_range": [
+        0.03,
+        0.08
+      ]
+    },
+    {
+      "kind": "econ_print",
+      "tick": 650,
+      "magnitude_range": [
+        0.015,
+        0.03
+      ],
+      "market_wide": true
+    },
+    {
+      "kind": "dividend",
+      "tick": 1200,
+      "symbol": "META",
+      "amount_per_share": 0.5
+    }
+  ]
+}

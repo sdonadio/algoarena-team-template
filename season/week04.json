@@ -1,0 +1,73 @@
+{
+  "week": 4,
+  "label": "Market making \u2014 shorts unlock, post-only, opening auction, the ORCA IPO, purchase window 1",
+  "flags": {
+    "shorts_allowed": true,
+    "post_only_allowed": true,
+    "circuit_breakers": false,
+    "cancellation_fees": false,
+    "latency_enabled": false,
+    "multi_venue": true,
+    "futures_enabled": false,
+    "purchase_window": true
+  },
+  "position_limit": 800,
+  "scoring_counts": true,
+  "config": {
+    "OPENING_AUCTION_TICKS": 12,
+    "CLOSING_AUCTION": false,
+    "SSR_TRIGGER_PCT": 0.06,
+    "SHORT_LOCATE_CAP": 2000,
+    "LULD_BAND_PCT": 0.1
+  },
+  "events": [
+    {
+      "kind": "earnings",
+      "tick": 350,
+      "symbol": "AMZN",
+      "magnitude_range": [
+        0.03,
+        0.08
+      ]
+    },
+    {
+      "kind": "earnings",
+      "tick": 800,
+      "symbol": "GOOGL",
+      "magnitude_range": [
+        0.03,
+        0.08
+      ]
+    },
+    {
+      "kind": "econ_print",
+      "tick": 1150,
+      "magnitude_range": [
+        0.01,
+        0.025
+      ],
+      "market_wide": true
+    },
+    {
+      "kind": "dividend",
+      "tick": 600,
+      "symbol": "AAPL",
+      "amount_per_share": 0.25
+    },
+    {
+      "kind": "ipo",
+      "symbol": "ORCA",
+      "name": "Orca Analytics",
+      "offer_range": [
+        24.0,
+        28.0
+      ],
+      "shares": 4000,
+      "window": [
+        150,
+        450
+      ],
+      "tick": 550
+    }
+  ]
+}

@@ -1,0 +1,60 @@
+{
+  "week": 10,
+  "label": "Finale \u2014 full market structure, borrow at its scarcest",
+  "flags": {
+    "shorts_allowed": true,
+    "post_only_allowed": true,
+    "circuit_breakers": true,
+    "cancellation_fees": true,
+    "latency_enabled": true,
+    "multi_venue": true,
+    "futures_enabled": true,
+    "purchase_window": false
+  },
+  "position_limit": 1000,
+  "order_quota": 10,
+  "scoring_counts": true,
+  "config": {
+    "OPENING_AUCTION_TICKS": 15,
+    "CLOSING_AUCTION": true,
+    "CLOSING_AUCTION_TICKS": 12,
+    "SSR_TRIGGER_PCT": 0.08,
+    "SHORT_LOCATE_CAP": 600,
+    "LULD_BAND_PCT": 0.08
+  },
+  "events": [
+    {
+      "kind": "earnings",
+      "tick": 250,
+      "symbol": "AAPL",
+      "magnitude_range": [
+        0.05,
+        0.1
+      ]
+    },
+    {
+      "kind": "earnings",
+      "tick": 550,
+      "symbol": "TSLA",
+      "magnitude_range": [
+        0.05,
+        0.1
+      ]
+    },
+    {
+      "kind": "econ_print",
+      "tick": 850,
+      "magnitude_range": [
+        0.02,
+        0.04
+      ],
+      "market_wide": true
+    },
+    {
+      "kind": "dividend",
+      "tick": 1100,
+      "symbol": "AAPL",
+      "amount_per_share": 0.25
+    }
+  ]
+}

@@ -38,6 +38,7 @@ import exchange.config as config
 import exchange.ipo as ipo_mod
 import exchange.persistence as persistence
 import exchange.scenario as scenario_mod
+import exchange.leadlag as leadlag
 import exchange.scoring as scoring
 import exchange.seats as seats
 import exchange.upgrades as upgrades
@@ -562,6 +563,7 @@ class ExchangeServer:
         # play behaves exactly as it did before the season system existed.
         self.scenario = scenario_mod.active_scenario()
         self.scenario.apply()
+        self.lead_lag = leadlag.from_scenario(self.scenario)
         # The week's event calendar, plus the ramp scheduler that both
         # calendar events and teacher shocks apply their moves through.
         self.calendar = MarketCalendar(self.scenario.events)
@@ -2319,9 +2321,16 @@ class ExchangeServer:
             # basis a hedger depends on.
             if not config.is_future(sym):
                 fair = self._clamp_fair_move(engine.fair_value, fair)
+            if self.lead_lag is not None and self.session_open:
+                # Hidden week-8 link: this follower echoes its leader's mark
+                # move from `lag` ticks ago (exchange/leadlag.py).
+                fair *= self.lead_lag.factor(sym)
 
             engine.update_fair_value(fair)
             self.ref_prices[sym] = engine.tick()
+
+        if self.lead_lag is not None and self.session_open:
+            self.lead_lag.record(self.tick, self.ref_prices)
 
         # Auction countdowns: broadcast the indicative cross each tick,
         # then run the cross when the clock reaches zero.
@@ -4047,6 +4056,7 @@ class ExchangeServer:
         self.scenario.restore()
         self.scenario = scen
         self.scenario.apply()
+        self.lead_lag = leadlag.from_scenario(scen)
         self.calendar.load(scen.events)
         self.calendar.reset()
         self._season_dirty = True

@@ -125,6 +125,9 @@ class Scenario:
     # open play overrides it to False — see open_play().
     scoring_counts: bool = True
     events: list[dict[str, Any]] = field(default_factory=list)
+    # Hidden lead-lag links (week 8): the spec only — pairs, lags and signs
+    # come from a seed at run time (exchange/leadlag.py). None = no links.
+    lead_lag: dict[str, Any] | None = None
     # Whitelisted exchange.config overrides (see ALLOWED_CONFIG_OVERRIDES).
     config_overrides: dict[str, Any] = field(default_factory=dict)
     source: str = ""
@@ -249,6 +252,7 @@ def from_dict(raw: dict[str, Any], source: str = "") -> Scenario:
         order_quota=int(quota) if quota is not None else None,
         scoring_counts=bool(raw.get("scoring_counts", True)),
         events=list(raw.get("events") or []),
+        lead_lag=dict(raw["lead_lag"]) if isinstance(raw.get("lead_lag"), dict) else None,
         config_overrides={k: v for k, v in (raw.get("config") or {}).items()
                           if k in ALLOWED_CONFIG_OVERRIDES},
         source=source,

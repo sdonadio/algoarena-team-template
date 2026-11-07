@@ -1,6 +1,6 @@
 {
   "week": 8,
-  "label": "Multi-venue \u2014 NBBO routing, fee wars, the LUNA IPO",
+  "label": "Multi-venue and big data \u2014 NBBO routing, fee wars, hidden lead-lag links, the LUNA IPO",
   "flags": {
     "shorts_allowed": true,
     "post_only_allowed": true,
@@ -65,5 +65,27 @@
       ],
       "tick": 550
     }
-  ]
+  ],
+  "lead_lag": {
+    "pairs": 3,
+    "lag_range": [
+      3,
+      8
+    ],
+    "beta_range": [
+      0.3,
+      0.5
+    ],
+    "universe": [
+      "AAPL",
+      "MSFT",
+      "NVDA",
+      "TSLA",
+      "AMZN",
+      "GOOGL",
+      "META",
+      "NFLX",
+      "AMD"
+    ]
+  }
 }

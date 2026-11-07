@@ -119,6 +119,7 @@ def test_broker_borrowing_is_capped(server):
 # ── Carry costs ───────────────────────────────────────────────────────────────
 
 def test_interest_charged_on_borrowed_cash(server):
+    server.scenario.week, server.scenario.scoring_counts = 2, True   # financing accrues only in scored weeks
     p, _ = add_team(server, "b1", role="broker", cash=-10_000.0)
     p.positions["AAPL"] = 500   # keep net worth above maintenance
     server.ref_prices["AAPL"] = 100.0
@@ -128,6 +129,7 @@ def test_interest_charged_on_borrowed_cash(server):
 
 
 def test_borrow_fee_charged_on_shorts(server):
+    server.scenario.week, server.scenario.scoring_counts = 2, True   # financing accrues only in scored weeks
     p, _ = add_team(server, "t1", cash=100_000.0)
     p.positions["AAPL"] = -50
     server.ref_prices["AAPL"] = 100.0

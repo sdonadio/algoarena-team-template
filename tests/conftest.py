@@ -39,6 +39,23 @@ def _isolate_season_state(monkeypatch, tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _no_session_recording(monkeypatch, tmp_path_factory):
+    """Keep test recordings out of the repo's sessions/ directory.
+
+    set_week now rolls a per-week tape whenever config.RECORD_WEEKS is on
+    (the hosted default), so without this every test that switches weeks
+    would litter sessions/. Tests that are ABOUT recording re-enable the
+    flags in their own fixtures, which run after this one.
+    """
+    import exchange.config as config
+    monkeypatch.setattr(config, "RECORD_WEEKS", False)
+    monkeypatch.setattr(
+        config, "SESSIONS_DIR",
+        str(tmp_path_factory.mktemp("sessions")))
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _no_scenario_env(monkeypatch):
     """Tests must not inherit a week from the developer's shell."""
     monkeypatch.delenv("GAME_WEEK", raising=False)

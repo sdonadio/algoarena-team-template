@@ -650,6 +650,141 @@ class ShockPredictor(SimBot):
 
 
 # ---------------------------------------------------------------------------
+# Flash sniper (week 7 "fast market")
+# ---------------------------------------------------------------------------
+
+class FlashSniper(SimBot):
+    """Trades against unannounced flashes and exits on the revert.
+
+    Live, a flash is visible only through the FLASH session event broadcast
+    as it fires (exchange/server.py `_fire_flash`). The headless arena
+    delivers no session events, so this bot reads the same public facts —
+    symbol, signed move, revert length — off the calendar's live flash ramp,
+    which is equivalent to having received FLASH on the tick it fired.
+
+    `lag` models a slow bot: an O(n)-per-message on_tick that is `lag`
+    ticks behind the feed reacts `lag` ticks late, by which time part (or
+    all) of the dislocation has reverted. lag=0 is the fast bot. Every
+    flash's net cash result (fees included) is appended to `flash_pnl`.
+
+    Exit: by default an aggressive (taker) clip once the flash has fully
+    reverted. With `exit_frac` set, the bot instead rests a passive exit
+    `exit_frac` of the way from its entry back to the pre-flash level the
+    moment it is filled (the market maker's requote crosses it on the way
+    back, so it pays no second taker fee), and only takes whatever is left
+    once the revert is over.
+
+    Entry: by default one IOC at the touch (whatever is there when the bot
+    gets round to it). With `min_edge` set, an IOC sweeping the ladder down
+    to the price that still leaves `min_edge` of the move to earn, retried
+    each tick until the revert ends — the disciplined version.
+    Not in the default population — opt in with ("flash_sniper", {...}).
+    """
+
+    preset = "flash_sniper"
+    role = "trader"
+
+    def __init__(self, team_id: str, cash: float = 100_000.0,
+                 lag: int = 0, notional: float = 40_000.0,
+                 max_shares: int = 300, exit_frac: float | None = None,
+                 min_edge: float | None = None, **kwargs: Any) -> None:
+        super().__init__(team_id, cash, **kwargs)
+        self.lag = max(0, int(lag))
+        self.notional = notional
+        self.max_shares = max_shares
+        self.exit_frac = exit_frac
+        self.min_edge = min_edge
+        # flash label -> its state (see act)
+        self._flashes: dict[str, dict[str, Any]] = {}
+        self.flash_pnl: list[dict[str, Any]] = []
+
+    @staticmethod
+    def _server(arena: Any) -> Any:
+        srv = getattr(arena, "server", None)
+        if srv is None:                       # a VenueView
+            srv = arena.arena.servers[arena.index]
+        return srv
+
+    async def act(self, arena: "HeadlessArena") -> None:
+        srv = self._server(arena)
+        tick = srv.tick
+        for ramp in getattr(srv.calendar, "ramps", ()):
+            if getattr(ramp, "kind", "") != "flash":
+                continue
+            if ramp.label not in self._flashes:
+                self._flashes[ramp.label] = {
+                    "symbol": ramp.symbol,
+                    "fired": tick - (ramp.elapsed - 1),
+                    "pct": ramp.pct, "revert": ramp.settle_ticks,
+                    "start_px": ramp.start_price, "entry": None,
+                    "done": False,
+                }
+        for st in self._flashes.values():
+            if st["done"]:
+                continue
+            sym, fired, revert = st["symbol"], st["fired"], st["revert"]
+            entry = st["entry"]
+            if entry is None:
+                if tick < fired + self.lag:
+                    continue
+                if tick > fired + revert:
+                    st["done"] = True         # too slow: already reverted
+                    continue
+                side = "buy" if st["pct"] < 0 else "sell"
+                px = (arena.best_ask(sym) if side == "buy"
+                      else arena.best_bid(sym))
+                if not px:
+                    continue
+                if self.min_edge is not None:
+                    # Sweep the ladder, but only while at least `min_edge`
+                    # of the dislocation is still there to be earned.
+                    keep = self.min_edge * abs(st["pct"])
+                    px = round(st["start_px"] * (1 - keep if side == "buy"
+                                                 else 1 + keep), 2)
+                qty = max(1, min(self.max_shares, int(self.notional / px)))
+                # Positions are measured against the holding before entry
+                # (some weeks grant starting inventory).
+                base = self.position(sym)
+                cash = self.portfolio.cash
+                await arena.order(self, sym, side, qty, px, "ioc")
+                filled = abs(self.position(sym) - base)
+                if not filled and self.min_edge is not None:
+                    continue                  # nothing cheap enough yet
+                if filled:                    # average fill (fees included)
+                    px = abs(self.portfolio.cash - cash) / filled
+                st["entry"] = {"cash": cash, "tick": tick, "px": px,
+                               "side": side, "base": base, "qty": filled}
+                if filled and self.exit_frac is not None:
+                    target = px + self.exit_frac * (st["start_px"] - px)
+                    out = "sell" if side == "buy" else "buy"
+                    await arena.order(self, sym, out, filled,
+                                      round(target, 2), "limit")
+                continue
+            extra = self.position(sym) - entry["base"]
+            if tick < fired + revert and extra:
+                continue                      # hold through the revert
+            if self.exit_frac is not None:
+                arena.cancel_all(self, sym)   # unfilled passive exit
+            if extra:
+                side_out = "sell" if extra > 0 else "buy"
+                px = (arena.best_bid(sym) if extra > 0
+                      else arena.best_ask(sym))
+                if px:
+                    await arena.order(self, sym, side_out, abs(extra), px,
+                                      "ioc")
+                if self.position(sym) != entry["base"]:
+                    continue                  # retry next tick
+            self.flash_pnl.append({
+                "symbol": sym, "fired": fired, "entry_tick": entry["tick"],
+                "exit_tick": tick, "pct": st["pct"], "side": entry["side"],
+                "entry_px": entry["px"], "start_px": round(st["start_px"], 4),
+                "qty": entry["qty"],
+                "pnl": round(self.portfolio.cash - entry["cash"], 2),
+            })
+            st["done"] = True
+
+
+# ---------------------------------------------------------------------------
 # The cross-venue arbitrageur
 # ---------------------------------------------------------------------------
 
@@ -741,6 +876,7 @@ BOT_PRESETS: dict[str, Callable[..., SimBot]] = {
     "leveraged_punter": LeveragedPunter,
     "shock_predictor": ShockPredictor,
     "arb": CrossVenueArbitrageur,
+    "flash_sniper": FlashSniper,
 }
 
 # The default balance-testing field: two market makers of opposite style,

@@ -68,6 +68,18 @@ REQUOTE_INTERVAL_SEC = 0.5  # how often to refresh quotes (seconds)
 # unaffected (needs_requote gates those).
 QUOTE_BURST_SYMBOLS = int(os.environ.get("QUOTE_BURST_SYMBOLS", "2"))
 
+# Order/cancel messages the requote loop may send per SECOND (0 = unmetered).
+# QUOTE_BURST_SYMBOLS only staggers symbols we have never quoted; once every
+# symbol is live, a busy market refills `needs_requote` on its own (a filled
+# side always needs replacing), and a full cancel+repost is 4 × QUOTE_LEVELS
+# messages per symbol. Ten symbols twice a second is ~240 messages/tick
+# against a venue quota of 20 — the hosted house MM logged ~280 RATE_LIMITED
+# warnings a minute doing exactly that. Matching the exchange's default
+# ORDER_QUOTA_PER_TICK keeps the desk inside its allowance; the loop rotates
+# the symbol order every pass so nothing starves behind the budget.
+REQUOTE_MSG_BUDGET_PER_SEC = float(
+    os.environ.get("REQUOTE_MSG_BUDGET_PER_SEC", "20"))
+
 # Seconds for the quote centre to close half the gap to the external (Yahoo)
 # reference. Slow on purpose: Yahoo is a 5-second poll of a different market,
 # so anchoring fast would import its staleness as noise, while not anchoring at

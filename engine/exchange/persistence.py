@@ -29,6 +29,8 @@ import tempfile
 import time
 from typing import Any
 
+import exchange.config as config
+
 logger = logging.getLogger(__name__)
 
 SEASON_VERSION = 1
@@ -82,13 +84,17 @@ def portfolio_from_dict(cls: type, raw: dict[str, Any]) -> Any:
     p.total_rebates_earned = float(raw.get("total_rebates_earned", 0.0))
     p.total_carry_paid = float(raw.get("total_carry_paid", 0.0))
     p.starting_cash = float(raw.get("starting_cash", p.cash) or p.cash)
-    p.liquidated = bool(raw.get("liquidated", False))
+    # A house bot restored from a season saved BEFORE the exemption existed
+    # would come back still barred from trading, and the venue would start
+    # with no two-sided quote at all. The exemption is retroactive.
+    p.liquidated = (bool(raw.get("liquidated", False))
+                    and not config.is_house_bot(p.team_id))
     return p
 
 
 def build_state(server: Any) -> dict[str, Any]:
     """Snapshot everything about the season that must outlive the process."""
-    return {
+    state = {
         "version": SEASON_VERSION,
         "saved_at": time.time(),
         "week": server.scenario.week,
@@ -118,6 +124,14 @@ def build_state(server: Any) -> dict[str, Any]:
                             for k, v in server.ipo_allocations.items()},
         },
     }
+    # Owner-node books (config.VENUE_REVENUE_TO_OWNER). Written only when one
+    # exists, so a season file from a venue with the flag off is unchanged.
+    owners = getattr(server, "venue_owner_portfolios", None)
+    if owners:
+        state["venue_owner_portfolios"] = {
+            tid: portfolio_to_dict(p) for tid, p in owners.items()
+        }
+    return state
 
 
 # ---------------------------------------------------------------------------

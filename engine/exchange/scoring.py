@@ -146,6 +146,54 @@ def downsample(points: Sequence[Any], limit: int = 120) -> list[Any]:
     return out
 
 
+# A graded block is one contiguous run of snapshots; blocks are days apart.
+# Any gap wider than this many snapshots starts a new block.
+BLOCK_GAP_SNAPSHOTS = 20
+
+
+def pad_to_block_open(
+    equity_history: dict[str, list[Any]],
+) -> dict[str, list[tuple[int, float]]]:
+    """Left-pad every bot's equity path to the open of the block it joined.
+
+    A bot that connects twenty minutes into a block (or whose portfolio is
+    created mid-block) has fewer snapshots than its peers, and its path has
+    skipped whatever shocks fired before it arrived: lower volatility, no
+    drawdown, a better ratio for doing nothing. Session 2 (2026-10-09) was
+    won that way. So a late bot is scored as a FLAT bot: its path starts at
+    the block's first snapshot tick, at its own first net worth, and stays
+    flat until it actually appeared. Flat returns sit below the risk-free
+    drift, so arriving late is now a small penalty rather than an edge.
+
+    Padding stays inside the block the bot first appears in: a bot created in
+    week 3 is not extended back into week 2 (that would charge it for a block
+    it was not part of). Blocks are detected from the union of snapshot ticks:
+    a gap wider than BLOCK_GAP_SNAPSHOTS × SEASON_SNAPSHOT_TICKS starts a new
+    block. Input may hold tuples or lists; output holds (tick, value) tuples.
+    """
+    ticks = sorted({int(t) for hist in equity_history.values() for t, _ in (hist or [])})
+    if not ticks:
+        return {k: [(int(t), float(v)) for t, v in (h or [])] for k, h in equity_history.items()}
+    blocks: list[list[int]] = [[ticks[0]]]
+    gap = BLOCK_GAP_SNAPSHOTS * _SNAPSHOT_TICKS
+    for t in ticks[1:]:
+        if t - blocks[-1][-1] > gap:
+            blocks.append([t])
+        else:
+            blocks[-1].append(t)
+    out: dict[str, list[tuple[int, float]]] = {}
+    for team_id, hist in equity_history.items():
+        path = [(int(t), float(v)) for t, v in (hist or [])]
+        if not path:
+            out[team_id] = path
+            continue
+        first_tick, first_val = path[0]
+        block = next(b for b in blocks if b[0] <= first_tick <= b[-1])
+        pad = [(t, first_val) for t in block if t < first_tick]
+        out[team_id] = pad + path
+    return out
+
+
 def build_season_block(
     equity_history: dict[str, list[Any]],
     portfolios: dict[str, Any],
@@ -159,7 +207,9 @@ def build_season_block(
     standings = []
     curves: dict[str, list[list[float]]] = {}
 
-    for team_id, hist in equity_history.items():
+    # Late joiners are scored as flat from the block open (see pad_to_block_open).
+    padded = pad_to_block_open(equity_history)
+    for team_id, hist in padded.items():
         if not hist:
             continue
         equity = [float(v) for _, v in hist]

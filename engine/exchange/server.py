@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import pathlib
+import random
 import signal
 import socket
 import sys
@@ -41,7 +42,7 @@ import exchange.scoring as scoring
 import exchange.seats as seats
 import exchange.upgrades as upgrades
 import shared.auth as auth
-from exchange.calendar import DIVIDEND, MarketCalendar
+from exchange.calendar import DIVIDEND, FLASH, MarketCalendar
 import exchange.limits as limits
 from exchange.circuit_breaker import CircuitBreaker
 import exchange.price_engine as price_engine
@@ -83,6 +84,18 @@ logger = logging.getLogger(__name__)
 # out which levels need a QueueUpdate. High enough to cover any real book;
 # the cancel itself is depth-independent (OrderBook.cancel_team_orders).
 _SWEEP_SCAN_LEVELS = 10_000
+
+# Owner-only SessionEvents that are also written to the session tape. These
+# are the risk/primary-market moments the graded live-readiness bars turn on
+# (scripts/live_readiness.py) and they never reach the broadcast bus, so
+# without this the tape cannot show them. ORDER_REJECT is deliberately absent:
+# it is the teacher relay copy of a rejection already recorded from the
+# ErrorMsg sent to the bot, and recording both would double-count rejects.
+_OWNER_AUDIT_EVENTS = frozenset({
+    "STOP_TRIGGERED",       # week 5: the stop actually fired
+    "MARGIN_CALL",          # weeks 5/9: leverage warning, per team
+    "IPO_SUB_RESULT",       # weeks 4/6/8: bookbuild participation
+})
 
 
 def _new_part_stats() -> dict:
@@ -150,6 +163,10 @@ class Portfolio:
     # which this book is exempt from the maintenance check. Not persisted —
     # a grace period is a within-session courtesy, not a season-long one.
     shield_until_tick: int = 0
+    # One-shot latch for the house-bot maintenance exemption: the warning is
+    # logged the first time an exempt book crosses the threshold, not every
+    # tick for the rest of the week.
+    house_warned: bool = False
     # One-shot latch for the earned-leverage margin call (config.LEVERAGE_ENABLED):
     # set when margin_ratio first falls below MARGIN_CALL_RATIO so the warning
     # fires once, cleared when the team recovers back above the ratio.
@@ -219,9 +236,13 @@ class Portfolio:
                            side: str, fee: float, rebate: float = 0.0) -> None:
         """Record a futures fill.
 
-        No notional changes hands — a future is a promise, not a purchase. Only
-        fees move cash; the position and its entry price are what matter, and
-        P&L reaches cash through settle_future().
+        No notional changes hands — a future is a promise, not a purchase.
+        Opening or adding moves only fees. Closing (all or part, or the closed
+        leg of a flip) pays the P&L on the closed contracts since the entry
+        price into cash — the same money settle_future() would have paid had
+        the position been marked there. Because settle_future() resets the
+        entry to each mark, a close only ever realises the move since the last
+        settlement, so nothing is counted twice.
         """
         signed = qty if side == "buy" else -qty
         old = self.positions.get(symbol, 0)
@@ -240,7 +261,9 @@ class Portfolio:
             # Reducing or flipping: realise P&L on the part that closes.
             closed = min(abs(old), qty)
             direction = 1 if old > 0 else -1
-            self.realized_pnl += (price - entry) * closed * direction
+            pnl = (price - entry) * closed * direction
+            self.realized_pnl += pnl
+            self.cash += pnl
             if qty > abs(old):
                 self.avg_cost[symbol] = price      # flipped to the other side
 
@@ -496,6 +519,13 @@ class ExchangeServer:
         self._internal_ref: dict[str, float] = {}
         # Exchange revenue: taker fees collected minus maker rebates paid out.
         self.exchange_revenue: float = 0.0
+        # config.VENUE_REVENUE_TO_OWNER (default off): the owning team's
+        # `exchange` node on a STUDENT venue, credited each trade's venue net
+        # fee. Deliberately NOT in self.portfolios — the node never connects,
+        # so it must never be matched, margined, liquidated, flattened or
+        # shown as a trading participant. It only feeds snapshot_equity and
+        # the season file. Empty (and absent from disk) when the flag is off.
+        self.venue_owner_portfolios: dict[str, Portfolio] = {}
         # Session recorder (JSONL file handle, active between open/close).
         self._recorder: Any = None
         # Recording size guard (config.RECORD_MAX_MB): bytes written to the
@@ -504,6 +534,10 @@ class ExchangeServer:
         self._record_bytes: int = 0
         self._record_path: str | None = None
         self._record_capped: bool = False
+        # Week of the graded live block this recording belongs to (None for an
+        # open-play, session-tied recording). set_week rolls a fresh file per
+        # week so Friday's block is one self-contained tape.
+        self._record_week: int | None = None
 
         # team_ids that authenticated as role="teacher"; allowed to send TeacherCommand.
         self.teacher_clients: set[str] = set()
@@ -539,7 +573,19 @@ class ExchangeServer:
         # Cached season standings — see _season_block().
         self._season_cache: dict | None = None
         self._season_dirty: bool = True
+        # True once this process has reconciled with the on-disk season —
+        # either by reading it or by writing it. The READ side is on even in
+        # open play (see season_loads), so the first checkpoint of a graded
+        # week extends the season instead of replacing it with whatever this
+        # process happens to hold.
+        self._season_loaded: bool = False
+        # Tick at which the venue entered open play (week 0), or None while a
+        # scored week is live. Anything snapshotted after it is free play and
+        # is dropped when the teacher switches into a scored week.
+        self._open_play_since_tick: int | None = None
         self.load_season()
+        if self.scenario.week <= 0:
+            self._open_play_since_tick = self.tick
 
     # ------------------------------------------------------------------
     # Connection handler (one coroutine per connected client)
@@ -616,6 +662,13 @@ class ExchangeServer:
                 team_id = msg.team_id
             reconnect = team_id in self.clients and self.clients[team_id] is not websocket
             self.clients[team_id] = websocket
+            if msg.role != "observer":
+                # PARTICIPANT records make "was this team connected for the
+                # block?" answerable from the tape alone. Observers are noise
+                # (namespaced ids, no seat) and are left out.
+                self._record_aux(type="participant", team_id=team_id,
+                                 event="connected", role=msg.role,
+                                 reconnect=reconnect)
             if reconnect:
                 logger.info("Reconnect: %s", team_id)
                 # A reconnect must start clean. The dead socket's `finally`
@@ -799,6 +852,9 @@ class ExchangeServer:
                     logger.exception("Cancel-on-disconnect failed for %s", team_id)
             if team_id:
                 logger.info("Disconnected: %s", team_id)
+                if owned_slot and not team_id.startswith("observer:"):
+                    self._record_aux(type="participant", team_id=team_id,
+                                     event="disconnected", role=conn_role)
 
     # ------------------------------------------------------------------
     # Order handling
@@ -1356,8 +1412,13 @@ class ExchangeServer:
             ))
             return
 
-        self._charge_cancel_fee(team_id, cancelled)
+        cancel_fee = self._charge_cancel_fee(team_id, cancelled)
         self.part_stats[team_id]["msgs"] += 1   # cancels count toward OTR too
+        # An accepted cancel is acknowledged by silence, so the tape would
+        # otherwise show a team that requotes furiously as doing nothing.
+        self._record_aux(type="order_cancel", team_id=team_id,
+                         order_id=cancelled.order_id, symbol=cancelled.symbol,
+                         fee=round(cancel_fee, 6))
 
         # The cancelled order vacated its spot; bots behind it advanced.
         self._queue_cache.pop(cancelled.order_id, None)
@@ -1915,6 +1976,36 @@ class ExchangeServer:
     # Trade settlement
     # ------------------------------------------------------------------
 
+    def _venue_owner_portfolio(self) -> Portfolio | None:
+        """The owning team's exchange-node book on THIS venue, created on
+        demand (cash 0, no positions). None on the primary venue, or when
+        VENUE_REVENUE_TO_OWNER is off. Never placed in self.portfolios."""
+        if not config.VENUE_REVENUE_TO_OWNER:
+            return None
+        node = config.venue_owner_node()
+        if not node:
+            return None
+        pf = self.venue_owner_portfolios.get(node)
+        if pf is None:
+            pf = Portfolio(team_id=node, role="exchange", level=1, cash=0.0)
+            self.venue_owner_portfolios[node] = pf
+            logger.info("Venue revenue → owner node %s (port %d)",
+                        node, config.PORT)
+        return pf
+
+    def _credit_venue_owner(self, amount: float) -> None:
+        """Credit one trade's venue net fee to the owning team's node.
+
+        Only per-trade fee income — seat purchases and cancel fees stay
+        venue-only. A transfer of revenue the venue already booked, so no
+        money is minted: exchange_revenue is unchanged.
+        """
+        if not amount:
+            return
+        pf = self._venue_owner_portfolio()
+        if pf is not None:
+            pf.cash += amount
+
     async def _process_trade(self, trade: Trade) -> None:
         """Settle a trade: update portfolios, notify parties, broadcast snapshot.
 
@@ -1954,11 +2045,15 @@ class ExchangeServer:
                 buyer_fee, buyer_rebate  = 0.0, rebate
                 seller_fee, seller_rebate = taker_fee, 0.0
             self.exchange_revenue += taker_fee - rebate
+            if config.VENUE_REVENUE_TO_OWNER:
+                self._credit_venue_owner(taker_fee - rebate)
             fee_paid, rebate_paid = taker_fee, rebate
         else:
             buyer_fee = seller_fee = trade.fee / 2
             buyer_rebate = seller_rebate = 0.0
             self.exchange_revenue += trade.fee
+            if config.VENUE_REVENUE_TO_OWNER:
+                self._credit_venue_owner(trade.fee)
             fee_paid, rebate_paid = trade.fee, 0.0
 
         buyer = self.portfolios.get(trade.buyer_id)
@@ -2083,8 +2178,13 @@ class ExchangeServer:
             await asyncio.sleep(config.SNAPSHOT_INTERVAL_SEC)
             if not self.clients:
                 continue
+            full = self._open_play_due("_last_open_snap",
+                                       config.OPEN_PLAY_SNAPSHOT_INTERVAL_SEC)
             for symbol, book in self.books.items():
-                await self._broadcast(self._make_snapshot(symbol, book))
+                if full:
+                    await self._broadcast(self._make_snapshot(symbol, book))
+                else:
+                    await self._broadcast_offbeat(self._make_snapshot(symbol, book))
                 # Observer/teacher-only per-order queue ladder for the QUEUE tab.
                 await self._broadcast_ladder(symbol)
 
@@ -2092,8 +2192,44 @@ class ExchangeServer:
         """Push the leaderboard every LEADERBOARD_INTERVAL_SEC whenever clients are connected."""
         while True:
             await asyncio.sleep(config.LEADERBOARD_INTERVAL_SEC)
-            if self.clients:
+            if not self.clients:
+                continue
+            if self._open_play_due("_last_open_lb",
+                                   config.OPEN_PLAY_LEADERBOARD_INTERVAL_SEC):
                 await self._broadcast(self._build_leaderboard())
+            elif self._has_offbeat_clients():
+                await self._broadcast_offbeat(self._build_leaderboard())
+
+    def _offbeat_client(self, tid: str) -> bool:
+        """Clients that keep the full cadence when open play is throttled:
+        observers, the teacher and the venue's own (localhost) house bots."""
+        return (tid.startswith("observer:") or tid in self.teacher_clients
+                or config.is_house_bot(tid))
+
+    def _has_offbeat_clients(self) -> bool:
+        return any(self._offbeat_client(tid) for tid in self.clients)
+
+    async def _broadcast_offbeat(self, message: Any) -> None:
+        """Throttled open-play beat: send only to _offbeat_client connections
+        (not recorded, like the observer-only ladder)."""
+        payload = message.model_dump_json()
+        coros = [self._send_payload(tid, ws, payload)
+                 for tid, ws in list(self.clients.items())
+                 if self._offbeat_client(tid)]
+        if coros:
+            await asyncio.gather(*coros, return_exceptions=True)
+
+    def _open_play_due(self, attr: str, interval: float) -> bool:
+        """True when a periodic message should go to EVERY client. Always True
+        outside open play or with the throttle off (interval <= 0); in open play
+        True at most once per `interval` seconds (the offbeat clients get the rest)."""
+        if interval <= 0 or self.scenario.week > 0:
+            return True
+        now = time.monotonic()
+        if now - getattr(self, attr, 0.0) < interval:
+            return False
+        setattr(self, attr, now)
+        return True
 
     async def _markout_loop(self) -> None:
         """Score pending passive-fill markouts as each horizon elapses.
@@ -2338,6 +2474,8 @@ class ExchangeServer:
         for event in self.calendar.due_events(tick):
             if event.kind == DIVIDEND:
                 await self._pay_dividend(event)
+            elif event.kind == FLASH:
+                await self._fire_flash(event)
             else:
                 await self._fire_price_event(event)
 
@@ -2455,6 +2593,79 @@ class ExchangeServer:
             },
         ))
 
+    def _flash_eligible(self, sym: str, pct: float) -> bool:
+        """May a flash of `pct` fire on `sym` right now?
+
+        Never on a future (marked from its index), a halted name, or one a
+        news ramp is already driving (the flash would cancel the news). With
+        circuit breakers on, also never when the move already made over the
+        velocity window plus the flash would come within
+        FLASH_VELOCITY_HEADROOM of the halt threshold, and never a down
+        flash that would trip the short-sale rule: a flash is a short
+        mispricing to capture, not a halt or SSR trigger.
+        """
+        engine = self.price_engines.get(sym)
+        if engine is None or sym not in self.books or config.is_future(sym):
+            return False
+        if self.calendar.has_ramp(sym) or self.circuit_breaker.is_halted(sym):
+            return False
+        if config.CIRCUIT_BREAKERS_ENABLED:
+            hist = engine.price_history
+            window = config.VELOCITY_WINDOW_SEC
+            if len(hist) >= window and hist[-window] > 0:
+                moved = abs(engine.market_price - hist[-window]) / hist[-window]
+            else:
+                moved = 0.0
+            if (moved + abs(pct)
+                    >= config.FLASH_VELOCITY_HEADROOM * config.VELOCITY_HALT_PCT):
+                return False
+        if (pct < 0 and config.SSR_TRIGGER_PCT > 0 and sym not in self.ssr_active
+                and engine.session_return() + pct <= -config.SSR_TRIGGER_PCT):
+            return False
+        return True
+
+    async def _fire_flash(self, event) -> None:
+        """Fire an unannounced flash: a one-tick jump of `pct` that walks back
+        to the pre-flash fair value over `revert_ticks` ticks.
+
+        The symbol is the event's own, else one picked (with the event's
+        pre-drawn `pick`) from those eligible right now, so a series never
+        lands on a halted or mid-news name. A FLASH session event goes to
+        everyone as it happens — the only public trace of the flash — so the
+        recording timestamps it for graders measuring reaction time.
+        """
+        pct = event.resolve()
+        if event.symbol:
+            pool = [event.symbol]
+        else:
+            pool = sorted(event.symbols or self.books.keys())
+        candidates = [s for s in pool if self._flash_eligible(s, pct)]
+        if not candidates:
+            logger.info("FLASH @t%d skipped: no eligible symbol in %s",
+                        event.tick, ",".join(pool) or "-")
+            return
+        pick = event.pick if event.pick is not None else random.random()
+        sym = candidates[min(len(candidates) - 1, int(pick * len(candidates)))]
+        engine = self.price_engines[sym]
+        start = engine.fair_value
+        self.calendar.start_flash(sym, start, pct, event.revert_ticks,
+                                  label=f"flash@{event.tick}")
+        logger.info("FLASH %s %+.2f%% reverting over %d ticks (t%d)",
+                    sym, pct * 100, event.revert_ticks, self.tick)
+        await self._broadcast(SessionEvent(
+            event="FLASH",
+            message=(f"Flash: {sym} {pct * 100:+.2f}%, reverting over "
+                     f"{event.revert_ticks} ticks"),
+            data={
+                "symbol": sym,
+                "pct": round(pct, 6),
+                "revert_ticks": int(event.revert_ticks),
+                "tick": self.tick,
+                "session_tick": event.tick,
+                "start_price": round(start, 4),
+            },
+        ))
+
     async def _pay_dividend(self, event) -> None:
         """Settle a dividend in cash and drop the price ex-dividend.
 
@@ -2542,7 +2753,18 @@ class ExchangeServer:
         whose conservatively-marked net worth is below maintenance."""
         # Carry costs: margin interest on borrowed cash, borrow fees on shorts.
         # Idle cash earns interest — the hurdle rate a strategy must beat.
+        #
+        # Financing accrues ONLY in a scored week. The per-tick rates are
+        # sized for a one-hour block (0.000002/tick ≈ 0.7% a session), but
+        # the hosted venue ticks around the clock in open play: at that rate
+        # idle cash compounded 18.9% a DAY and had grown five-fold by the
+        # second graded block, by registration date (found 2026-10-09).
+        # Open play is unscored, so it carries no financing either way; the
+        # maintenance check below still runs every tick.
+        accrue = self.scenario.week > 0 and self.scenario.scoring_counts
         for p in self.portfolios.values():
+            if not accrue:
+                break
             if p.role == "observer" or p.liquidated:
                 continue
             carry = 0.0
@@ -2580,6 +2802,14 @@ class ExchangeServer:
                 if p.role == "observer" or p.liquidated:
                     continue
                 nw = p.net_worth(self.ref_prices)
+                # House bots are the venue's own furniture: liquidating the
+                # reference market maker leaves the book one-sided for every
+                # student. Never force-flatten them — but say so, once, so a
+                # sick house book is still visible in the log and on the wire.
+                if config.is_house_bot(p.team_id):
+                    if nw < p.starting_cash * config.MAINTENANCE_FRACTION:
+                        await self._warn_house_below_maintenance(p, nw)
+                    continue
                 # Earned-leverage margin call & maintenance (opt-in). Below the
                 # call ratio a one-shot warning fires; below the tighter
                 # maintenance-margin ratio the team is liquidated, IN ADDITION
@@ -2612,7 +2842,16 @@ class ExchangeServer:
     # ------------------------------------------------------------------
 
     def quota_for(self, team_id: str) -> float:
-        """Order/cancel messages per tick for one bot (0 = unmetered)."""
+        """Order/cancel messages per tick for one bot (0 = unmetered).
+
+        House bots (config.HOUSE_TEAM_IDS) get their own, much larger budget:
+        the reference broker's two-sided ladder is 4 × QUOTE_LEVELS messages
+        per symbol per requote, so quoting ten symbols against a student's
+        20/tick quota produces nothing but RATE_LIMITED rejections and a
+        book that is missing whichever symbols the MM had not reached yet.
+        """
+        if config.is_house_bot(team_id):
+            return float(config.HOUSE_ORDER_QUOTA_PER_TICK)
         return float(config.config_for_team(team_id, "order_quota"))
 
     def _take_quota(self, team_id: str, n: float = 1.0) -> bool:
@@ -2625,7 +2864,11 @@ class ExchangeServer:
         quota = self.quota_for(team_id)
         if quota <= 0:
             return True
-        key = config.team_of(team_id) or team_id
+        # A house bot is metered on its OWN id, never pooled with the roster
+        # team it happens to sit in: the house MM must not spend the flow
+        # bots' allowance (or a student team's, if one shares the seat).
+        key = (team_id if config.is_house_bot(team_id)
+               else config.team_of(team_id) or team_id)
         bucket = self.quotas.get(key)
         if bucket is None or bucket.refill != quota:
             # First message, or the quota changed (new week / quota upgrade).
@@ -2638,24 +2881,28 @@ class ExchangeServer:
         for bucket in self.quotas.values():
             bucket.tick()
 
-    def _charge_cancel_fee(self, team_id: str, order: Any) -> None:
+    def _charge_cancel_fee(self, team_id: str, order: Any) -> float:
         """Bill a cancellation, when the week charges for them.
 
         The fee goes to the venue, like every other exchange fee, and lands in
-        total_fees_paid so it shows up in the team's TCA.
+        total_fees_paid so it shows up in the team's TCA. Returns the amount
+        charged (0.0 when the week does not bill cancels) so the caller can
+        put it on the tape: total_fees_paid alone cannot say how much of a
+        team's bill was cancel spam, which is a week-7 readiness question.
         """
         if not self.scenario.flag("cancellation_fees"):
-            return
+            return 0.0
         fee = (config.CANCEL_FEE_PER_ORDER
                + config.CANCEL_FEE_PER_SHARE * max(0, order.remaining))
         if fee <= 0:
-            return
+            return 0.0
         portfolio = self.portfolios.get(team_id)
         if portfolio is None:
-            return
+            return 0.0
         portfolio.cash -= fee
         portfolio.total_fees_paid += fee
         self.exchange_revenue += fee
+        return fee
 
     def latency_for(self, team_id: str | None) -> float:
         """Outbound delay in seconds for one connection (0 = immediate).
@@ -2753,6 +3000,33 @@ class ExchangeServer:
         ws = self.clients.get(portfolio.team_id)
         if ws:
             await self._send(ws, ev)
+
+    async def _warn_house_below_maintenance(self, portfolio: Portfolio,
+                                            nw: float) -> None:
+        """Log ONCE that an exempt house book is below maintenance.
+
+        The exemption (config.HOUSE_TEAM_IDS) must not be silent: a house MM
+        bleeding through its maintenance threshold still means something is
+        wrong with the calibration (on the hosted arena it was
+        BORROW_FEE_PER_TICK compounding across a multi-day open-play session),
+        and the teacher should see it. Fires once per book per session.
+        """
+        if portfolio.house_warned:
+            return
+        portfolio.house_warned = True
+        logger.warning(
+            "house MM below maintenance — exempt  %s  net_worth=%.2f < %.2f",
+            portfolio.team_id, nw,
+            portfolio.starting_cash * config.MAINTENANCE_FRACTION)
+        await self._broadcast(SessionEvent(
+            event="HOUSE_BELOW_MAINTENANCE",
+            message=(f"{portfolio.team_id} is below maintenance margin but is "
+                     f"a house bot — exempt from liquidation so the book "
+                     f"stays two-sided"),
+            data={"team_id": portfolio.team_id, "net_worth": round(nw, 2),
+                  "maintenance": round(
+                      portfolio.starting_cash * config.MAINTENANCE_FRACTION, 2)},
+        ))
 
     async def _liquidate(self, portfolio: Portfolio, nw: float) -> None:
         """Force-flatten a team below maintenance: close every position at
@@ -2914,7 +3188,10 @@ class ExchangeServer:
         self.session_open_tick = self.tick
         self.ssr_active.clear()       # a new day clears the short-sale rule
         self._last_season_save = time.time()
-        self._start_recording()
+        # Opening a session while a week scenario is live names the tape after
+        # the week, so a block opened by SESSION_OPEN and one opened by
+        # set_week land in the same place for the checker.
+        self._start_recording(week=self.scenario.week or None)
         for engine in self.price_engines.values():
             engine.session_open = engine.market_price
 
@@ -3425,6 +3702,12 @@ class ExchangeServer:
                     f"${px * msg.quantity:,.0f} but you have ${available:,.0f}")
             else:
                 ok, detail = deal.subscribe(bot, msg.quantity, px)
+        # Attribute the indication to the BOT, not the socket: the portal
+        # relays subscriptions over the teacher connection, so the owner-copy
+        # of IPO_SUB_RESULT would be filed under the dashboard.
+        self._record_aux(type="ipo_subscribe", team_id=bot, symbol=msg.symbol,
+                         quantity=int(msg.quantity),
+                         max_price=float(msg.max_price), ok=bool(ok))
         if ws in self.teacher_ws:
             await self._send(ws, SessionEvent(
                 event="IPO_SUB_RESULT", message=detail,
@@ -3533,11 +3816,13 @@ class ExchangeServer:
 
     @property
     def season_persists(self) -> bool:
-        """Whether season state is read from and written to disk.
+        """Whether season state is WRITTEN to disk.
 
         Defaults to "only when a week is configured", so plain local play
         (`make exchange` with no env vars) stays ephemeral exactly as it was
-        before the season system existed.
+        before the season system existed: nothing is banked from open play.
+
+        Deliberately asymmetric with season_loads — see there.
         """
         mode = config.SEASON_PERSIST
         if mode in ("true", "1", "yes"):
@@ -3546,37 +3831,120 @@ class ExchangeServer:
             return False
         return self.scenario.week > 0
 
-    def load_season(self) -> bool:
+    @property
+    def season_loads(self) -> bool:
+        """Whether an existing season file is READ at startup.
+
+        Reading is NOT gated on the week. The hosted venue boots in open
+        play and only switches into a graded week on Friday; a process that
+        skipped the read would hold nothing but the teams connected to it,
+        and the first checkpoint of the block would overwrite every earlier
+        week's standings. Writing stays off until a week is set, so plain
+        local play is still ephemeral — with no season file on disk there is
+        nothing to read, and nothing is ever written.
+
+        Only SEASON_PERSIST=false turns the read side off.
+        """
+        return config.SEASON_PERSIST not in ("false", "0", "no")
+
+    def load_season(self, merge: bool = False) -> bool:
         """Restore portfolios, tick, revenue and equity history from disk.
 
-        Called once at startup. Returns True if a season file was loaded.
-        Positions come back as they were, so a team that closed a week short
-        NVDA opens the next week short NVDA — the whole point of a season.
+        Called once at startup, at ANY week — including open play (week 0),
+        as long as SEASON_PERSIST is not "false". See season_loads: the read
+        side is deliberately not gated on the week, because the hosted venue
+        boots parked in open play and only switches into the graded week
+        later.
+
+        With merge=True the file is folded into what this process already
+        holds instead of replacing it: a team on disk but not connected here
+        comes back whole, a team trading here keeps its live portfolio, and
+        the two equity histories are unioned by tick. That is the safety net
+        for a season file this process never read (it booted with the read
+        side off, or the file appeared afterwards) — without it, the first
+        checkpoint of a week would delete every team that happens not to be
+        connected right now.
+
+        Returns True if a season file was loaded. Positions come back as they
+        were, so a team that closed a week short NVDA opens the next week
+        short NVDA — the whole point of a season.
         """
-        if not self.season_persists:
+        if not self.season_loads:
             return False
         state = persistence.load()
         if not state:
             return False
         try:
             for tid, raw in (state.get("portfolios") or {}).items():
+                if merge and tid in self.portfolios:
+                    continue                  # the live book wins
                 self.portfolios[tid] = persistence.portfolio_from_dict(
                     Portfolio, raw)
-            self.equity_history = {
+            disk_history = {
                 tid: [(int(t), float(v)) for t, v in hist]
                 for tid, hist in (state.get("equity_history") or {}).items()
             }
-            self.tick = int(state.get("tick", 0))
-            self.exchange_revenue = float(state.get("exchange_revenue", 0.0))
-            self.sessions_played = int(state.get("sessions_played", 0))
+            if merge:
+                for tid, hist in disk_history.items():
+                    points = dict(hist)
+                    points.update(dict(self.equity_history.get(tid) or []))
+                    merged = sorted(points.items())
+                    if len(merged) > persistence.EQUITY_HISTORY_MAX:
+                        del merged[:len(merged) - persistence.EQUITY_HISTORY_MAX]
+                    self.equity_history[tid] = merged
+            else:
+                self.equity_history = disk_history
+            # Owner-node books (VENUE_REVENUE_TO_OWNER). Same rule as
+            # exchange_revenue: a plain restore REPLACES (never adds to) what
+            # this process holds, so a restart cannot double-count; a merge
+            # adds, because the live credit was earned after the file was
+            # written (disjoint periods).
+            disk_owner = {
+                str(tid): persistence.portfolio_from_dict(Portfolio, raw)
+                for tid, raw in (state.get("venue_owner_portfolios")
+                                 or {}).items()
+                if isinstance(raw, dict)
+            }
+            if merge:
+                for tid, pf in disk_owner.items():
+                    live = self.venue_owner_portfolios.get(tid)
+                    if live is None:
+                        self.venue_owner_portfolios[tid] = pf
+                    else:
+                        live.cash += pf.cash
+            elif disk_owner or self.venue_owner_portfolios:
+                self.venue_owner_portfolios = disk_owner
+            disk_tick = int(state.get("tick", 0))
+            disk_revenue = float(state.get("exchange_revenue", 0.0))
+            disk_sessions = int(state.get("sessions_played", 0))
+            if merge:
+                # Disjoint periods: this process's own numbers were earned
+                # after the file was written, so they add rather than replace.
+                self.tick = max(self.tick, disk_tick)
+                self.exchange_revenue += disk_revenue
+                self.sessions_played = max(self.sessions_played, disk_sessions)
+            else:
+                self.tick = disk_tick
+                self.exchange_revenue = disk_revenue
+                self.sessions_played = disk_sessions
             ipo_state = state.get("ipo") or {}
-            self.ipo_issued = {str(k): int(v) for k, v in
-                               (ipo_state.get("issued") or {}).items()}
-            self.ipo_proceeds = float(ipo_state.get("proceeds", 0.0))
-            self.ipo_allocations = {str(k): int(v) for k, v in
-                                    (ipo_state.get("allocations") or {}).items()}
-            self.listed_ipos = {}
+            issued = {str(k): int(v) for k, v in
+                      (ipo_state.get("issued") or {}).items()}
+            allocations = {str(k): int(v) for k, v in
+                           (ipo_state.get("allocations") or {}).items()}
+            proceeds = float(ipo_state.get("proceeds", 0.0))
+            if merge:
+                issued.update(self.ipo_issued)
+                allocations.update(self.ipo_allocations)
+                proceeds = max(proceeds, self.ipo_proceeds)
+            else:
+                self.listed_ipos = {}
+            self.ipo_issued = issued
+            self.ipo_allocations = allocations
+            self.ipo_proceeds = proceeds
             for sym, raw in (ipo_state.get("listed") or {}).items():
+                if merge and str(sym) in self.listed_ipos:
+                    continue
                 rec = {"name": str(raw.get("name", sym)),
                        "offer_price": float(raw.get("offer_price", 0.0)),
                        "week": int(raw.get("week", 0)),
@@ -3596,19 +3964,24 @@ class ExchangeServer:
             logger.warning("Season file malformed (%s) — starting fresh", exc)
             return False
         self._season_dirty = True
+        self._season_loaded = True
         logger.info(
-            "Season restored: %d portfolios, tick %d, %d sessions played",
+            "Season %s: %d portfolios, tick %d, %d sessions played",
+            "merged" if merge else "restored",
             len(self.portfolios), self.tick, self.sessions_played,
         )
         return True
 
     def save_season(self) -> bool:
-        """Checkpoint the season to disk (no-op when persistence is off)."""
+        """Checkpoint the season to disk (no-op when the write side is off)."""
         if not self.season_persists:
             return False
         ok = persistence.save(persistence.build_state(self))
         self._last_season_save = time.time()
         if ok:
+            # What is on disk is now our state, so a later merge-load would
+            # double-count everything we just wrote.
+            self._season_loaded = True
             logger.debug("Season checkpointed (tick %d)", self.tick)
         return ok
 
@@ -3626,6 +3999,7 @@ class ExchangeServer:
             for book in self.books.values():
                 book.cancel_team_orders(tid)
         self.portfolios.clear()
+        self.venue_owner_portfolios.clear()
         self.equity_history.clear()
         self.exchange_revenue = 0.0
         self.trade_log.clear()
@@ -3635,6 +4009,11 @@ class ExchangeServer:
         self.sessions_played = 0
         self._last_equity_snapshot_tick = 0
         self._season_dirty = True
+        # Nothing on disk any more: a later set_week must not merge-load a
+        # file that no longer exists, and open play restarts from tick 0.
+        self._season_loaded = False
+        if self.scenario.week <= 0:
+            self._open_play_since_tick = 0
         self.calendar.reset()
         # The primary market resets with the season: delist every IPO'd
         # security and forget the deals, or the durable done-once guard
@@ -3661,7 +4040,9 @@ class ExchangeServer:
         """Install a week's rule set: config overrides plus its calendar.
 
         The single seam for changing week, so the calendar can never end up
-        out of step with the active scenario.
+        out of step with the active scenario — and, because switching week
+        is also what turns season persistence on and off, the single seam
+        for keeping the scored equity series honest across that switch.
         """
         self.scenario.restore()
         self.scenario = scen
@@ -3669,11 +4050,38 @@ class ExchangeServer:
         self.calendar.load(scen.events)
         self.calendar.reset()
         self._season_dirty = True
+        if scen.week <= 0:
+            # Parked in open play: remember where free play began so the next
+            # switch into a scored week can forget everything after it.
+            if self._open_play_since_tick is None:
+                self._open_play_since_tick = self.tick
+            return
+        # Entering a scored week.
+        self._drop_open_play_snapshots()
+        self._open_play_since_tick = None
+        # The write side turns on with the week. If this process never read
+        # the season file, read it NOW and merge — otherwise the first
+        # checkpoint would overwrite every earlier week with just the state
+        # of the teams connected to this process.
+        if self.season_persists and not self._season_loaded:
+            self.load_season(merge=True)
+        if self.session_open:
+            # Baseline for the block: the week's return is measured from the
+            # equity at the switch, not from the first periodic snapshot.
+            self.snapshot_equity(force=True)
 
     async def set_week(self, week: int) -> None:
-        """Switch the live rule set to another week's scenario."""
+        """Switch the live rule set to another week's scenario.
+
+        Week 0 is OPEN PLAY — the permissive default the hosted venue runs
+        between graded blocks. There is no teacher/season/week00.json (open
+        play is the absence of a scenario, not a file), so it is resolved
+        here rather than loaded; without this the dashboard could switch INTO
+        a week but never back out of one.
+        """
         try:
-            scen = scenario_mod.load_week(week)
+            scen = (scenario_mod.open_play() if week <= 0
+                    else scenario_mod.load_week(week))
         except (OSError, ValueError) as exc:
             logger.error("Cannot load week %s: %s", week, exc)
             await self._broadcast(SessionEvent(
@@ -3685,6 +4093,11 @@ class ExchangeServer:
         self.set_scenario(scen)
         logger.info("WEEK → %d (%s)", scen.week, scen.label)
         logger.info("  %s", scen.flag_summary())
+        # Roll the tape BEFORE the announcement so WEEK_CHANGED is the first
+        # line of the new file: the checker reads it as the start of the
+        # graded block. Going back to week 0 closes the tape AFTER the
+        # announcement, so the file ends with the marker that ended the block.
+        self._roll_week_recording(scen.week)
         await self._broadcast(SessionEvent(
             event="WEEK_CHANGED",
             message=f"Week {scen.week}: {scen.label}",
@@ -3692,13 +4105,49 @@ class ExchangeServer:
         ))
         await self._announce_calendar()
         await self._broadcast(self._build_leaderboard())
+        if scen.week <= 0:
+            self._stop_recording()
+
+    def _drop_open_play_snapshots(self) -> None:
+        """Forget equity points taken while the venue was in open play.
+
+        The belt-and-braces half of the week-0 rule: snapshot_equity() already
+        refuses to append at week 0, but a scenario file that declares week 0
+        with scoring on, or state carried in from another path, must not leave
+        free-play ticks in the series the graded week is scored from. Points
+        at or before the moment open play started are earlier weeks' and are
+        kept.
+        """
+        since = self._open_play_since_tick
+        if since is None:
+            return
+        dropped = 0
+        for tid in list(self.equity_history):
+            hist = self.equity_history[tid]
+            keep = [pt for pt in hist if pt[0] <= since]
+            dropped += len(hist) - len(keep)
+            if keep:
+                self.equity_history[tid] = keep
+            else:
+                del self.equity_history[tid]
+        if dropped:
+            self._season_dirty = True
+            logger.info("Dropped %d open-play equity snapshot(s) after tick %d",
+                        dropped, since)
 
     def snapshot_equity(self, force: bool = False) -> None:
         """Append one equity point per team, at most every SNAPSHOT_TICKS.
 
         Only weeks with scoring_counts contribute, so week 1 stays paper.
+
+        Week 0 (open play) never contributes either, whatever the scenario
+        claims. The hosted venue runs an always-open session and sits in open
+        play between Friday's graded blocks; without this guard a week of
+        free-play equity would be sitting in memory when the teacher switches
+        to week N, and the first checkpoint would write all of it into every
+        team's season mean, vol and drawdown.
         """
-        if not self.scenario.scoring_counts:
+        if self.scenario.week <= 0 or not self.scenario.scoring_counts:
             return
         every = max(1, config.SEASON_SNAPSHOT_TICKS)
         if not force and (self.tick - self._last_equity_snapshot_tick) < every:
@@ -3714,6 +4163,18 @@ class ExchangeServer:
             hist.append((self.tick, round(p.net_worth(self.ref_prices), 4)))
             if len(hist) > persistence.EQUITY_HISTORY_MAX:
                 del hist[:len(hist) - persistence.EQUITY_HISTORY_MAX]
+        if config.VENUE_REVENUE_TO_OWNER:
+            # Make sure the owner node exists from the block's first snapshot
+            # (at cash 0), so every dollar it earns lands as a return rather
+            # than as its opening value.
+            self._venue_owner_portfolio()
+            for tid, p in self.venue_owner_portfolios.items():
+                if tid in self.portfolios:
+                    continue        # an exchange seat is refused at handshake
+                hist = self.equity_history.setdefault(tid, [])
+                hist.append((self.tick, round(p.cash, 4)))
+                if len(hist) > persistence.EQUITY_HISTORY_MAX:
+                    del hist[:len(hist) - persistence.EQUITY_HISTORY_MAX]
         self._season_dirty = True
 
     async def inject_shock(self, shock_id: str, params: dict | None = None) -> None:
@@ -4160,8 +4621,11 @@ class ExchangeServer:
         (every SEASON_SNAPSHOT_TICKS) or the week changes.
         """
         if self._season_dirty or self._season_cache is None:
+            pfs = self.portfolios
+            if self.venue_owner_portfolios:
+                pfs = {**self.venue_owner_portfolios, **self.portfolios}
             self._season_cache = scoring.build_season_block(
-                self.equity_history, self.portfolios, self.scenario)
+                self.equity_history, pfs, self.scenario)
             self._season_dirty = False
         return self._season_cache
 
@@ -4194,9 +4658,9 @@ class ExchangeServer:
 
     async def _send(self, websocket: Any, message: Any) -> None:
         """Send a message to one client; silently ignore connection errors."""
-        await self._send_payload(
-            self.ws_to_team.get(websocket), websocket,
-            message.model_dump_json())
+        team_id = self.ws_to_team.get(websocket)
+        self._record_owner_copy(message, team_id)
+        await self._send_payload(team_id, websocket, message.model_dump_json())
 
     async def _send_payload(self, team_id: str | None, websocket: Any,
                             payload: str) -> None:
@@ -4246,8 +4710,18 @@ class ExchangeServer:
     # Session recording (replay with scripts/replay_session.py)
     # ------------------------------------------------------------------
 
-    def _record(self, payload: str) -> None:
-        """Append one broadcast message to the session recording (JSONL).
+    def _record(self, payload: str, aux: bool = False) -> None:
+        """Append one message to the session recording (JSONL).
+
+        Every line carries the engine `tick` as well as the wall clock, because
+        the graded checks are expressed in ticks ("reacted within 60 ticks of
+        the shock") while replay is expressed in seconds.
+
+        `aux=True` marks a record that was NOT broadcast — an owner-only order
+        ack/reject, a cancel, a connect/disconnect. Those lines exist so the
+        tape shows what each team ATTEMPTED, not just what the market saw;
+        scripts/replay_session.py skips them so replay stays a faithful
+        re-run of the public feed.
 
         Stops (once, at WARNING) when the file passes config.RECORD_MAX_MB - a
         long hosted session must never fill the disk. Trading continues and the
@@ -4255,7 +4729,9 @@ class ExchangeServer:
         """
         if self._recorder is None:
             return
-        line = f'{{"ts": {time.time():.3f}, "msg": {payload}}}\n'
+        flag = ', "aux": true' if aux else ''
+        line = (f'{{"ts": {time.time():.3f}, "tick": {self.tick}{flag}, '
+                f'"msg": {payload}}}\n')
         try:
             self._recorder.write(line)
         except OSError as exc:
@@ -4272,6 +4748,39 @@ class ExchangeServer:
                 self._record_path or config.SESSIONS_DIR)
             self._stop_recording()
 
+    def _record_aux(self, **record: Any) -> None:
+        """Append one non-broadcast audit record to the tape (team ids only).
+
+        Cheap when nothing is recording: we bail before serialising anything.
+        """
+        if self._recorder is None:
+            return
+        self._record(json.dumps(record), aux=True)
+
+    def _record_owner_copy(self, message: Any, team_id: str | None) -> None:
+        """Mirror an owner-only message into the tape, tagged with its team.
+
+        Order acks and rejects are sent to the owning socket only, so a tape
+        of broadcasts alone shows fills but never attempts — it cannot tell a
+        bot that sat dead all session from one that tried every tick and was
+        refused. The graded live-readiness bars need exactly that difference.
+
+        Privacy: the team id and the reject CODE, never a token, never the
+        team's resting size beyond what its own ack already states.
+        """
+        if self._recorder is None:
+            return
+        if isinstance(message, OrderAck):
+            self._record(message.model_dump_json(), aux=True)
+        elif isinstance(message, ErrorMsg):
+            if not team_id:
+                return      # pre-handshake error: no team to attribute it to
+            self._record_aux(type="order_reject", team_id=team_id,
+                             code=message.code, message=message.message)
+        elif isinstance(message, SessionEvent) and message.event in _OWNER_AUDIT_EVENTS:
+            self._record_aux(type="private_event", team_id=team_id or "",
+                             event=message.event, data=message.data)
+
     @staticmethod
     def _record_cap_bytes() -> int:
         """config.RECORD_MAX_MB as a byte count (0 = uncapped)."""
@@ -4281,22 +4790,72 @@ class ExchangeServer:
             return 0
         return int(mb * 1024 * 1024) if mb > 0 else 0
 
-    def _start_recording(self) -> None:
-        if not config.RECORD_SESSIONS:
+    def _start_recording(self, week: int | None = None) -> None:
+        """Open a fresh recording file.
+
+        week=None → the open-play recording tied to SESSION_OPEN/CLOSED, gated
+        on config.RECORD_SESSIONS as it always was.
+
+        week=N>0 → a graded live block: sessions/session_weekNN_<ts>.jsonl,
+        written when RECORD_SESSIONS *or* config.RECORD_WEEKS is on. The
+        hosted venue keeps one week-0 session open for days, so open-play
+        recording is often off; Friday's block must be on the tape regardless.
+
+        The file opens with a roll call — one PARTICIPANT record per already
+        connected client — because a mid-session roll would otherwise start
+        with nobody apparently connected.
+        """
+        if week:
+            if not (config.RECORD_SESSIONS or config.RECORD_WEEKS):
+                return
+        elif not config.RECORD_SESSIONS:
             return
+        self._stop_recording()
         os.makedirs(config.SESSIONS_DIR, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(config.SESSIONS_DIR, f"session_{stamp}.jsonl")
-        self._recorder = open(path, "w")
+        # Two venues sharing sessions/ get the same set_week at the same
+        # second from the season clock, and open(..., "w") would truncate
+        # the other venue's tape. A STUDENT venue tags its files with its
+        # port; the primary's names are exactly as they always were.
+        if not config.is_primary_venue():
+            stamp = f"{stamp}_p{config.PORT}"
+        name = (f"session_week{week:02d}_{stamp}.jsonl" if week
+                else f"session_{stamp}.jsonl")
+        path = os.path.join(config.SESSIONS_DIR, name)
+        # Line-buffered: the tape is the graded record of a live block, and a
+        # venue that dies mid-session must not take the last 8 KB of evidence
+        # with it. One small write per message is nothing next to the
+        # WebSocket fan-out already happening on the same line.
+        self._recorder = open(path, "w", buffering=1)
         self._record_bytes = 0
         self._record_path = path
         self._record_capped = False
+        self._record_week = week
         logger.info("Recording session → %s", path)
+        for tid in list(self.clients):
+            if tid.startswith("observer:"):
+                continue
+            self._record_aux(type="participant", team_id=tid,
+                             event="connected", roll_call=True)
 
     def _stop_recording(self) -> None:
         if self._recorder:
             self._recorder.close()
             self._recorder = None
+        self._record_week = None
+
+    def _roll_week_recording(self, week: int) -> None:
+        """Start/stop the per-week tape when the teacher switches scenarios.
+
+        Called BEFORE the WEEK_CHANGED broadcast so that event is the first
+        line of the new file — the checker reads it as the start of the block.
+        Switching to week 0 (back to open play) is a no-op here: set_week
+        stops the tape AFTER its broadcast, so the file ends with the marker
+        that ended the block. Re-setting the SAME week keeps the open tape.
+        """
+        if week <= 0 or week == self._record_week:
+            return
+        self._start_recording(week=week)
 
 
 # ---------------------------------------------------------------------------

@@ -52,16 +52,34 @@ logger = logging.getLogger(__name__)
 # So fee_tier is priced where a busy desk breaks even in a handful of sessions,
 # and the rest are priced as OPTIONALITY: cheap enough to be a real choice,
 # never so cheap that buying the whole shop is correct.
-PRICE_POSITION_LIMIT =  30_000
-PRICE_MARGIN_PLUS    =  40_000
-PRICE_FEE_TIER       =  40_000
-PRICE_ORDER_QUOTA    =  30_000
-PRICE_COLOCATION     =  50_000
+# UPGRADE_PRICE_MULTIPLIER scales the whole shop (default 1 = the prices
+# below, unchanged). A venue that wants its shop to be punitive sets it in its
+# environment, e.g. 5.
+def _price_multiplier() -> float:
+    try:
+        m = float(os.environ.get("UPGRADE_PRICE_MULTIPLIER", "1") or 1)
+    except ValueError:
+        return 1.0
+    return m if m > 0 else 1.0
+
+
+_PRICE_MULT = _price_multiplier()
+
+
+def _price(base: int) -> int:
+    return int(round(base * _PRICE_MULT))
+
+
+PRICE_POSITION_LIMIT = _price(30_000)
+PRICE_MARGIN_PLUS    = _price(40_000)
+PRICE_FEE_TIER       = _price(40_000)
+PRICE_ORDER_QUOTA    = _price(30_000)
+PRICE_COLOCATION     = _price(50_000)
 # Phase 10 additions: a data product, an insurance policy, and a report.
-PRICE_CALENDAR_FEED  =  35_000
-PRICE_LOCATE_DESK    =  35_000
-PRICE_RISK_SHIELD    =  45_000
-PRICE_ANALYTICS_PRO  =  25_000
+PRICE_CALENDAR_FEED  = _price(35_000)
+PRICE_LOCATE_DESK    = _price(35_000)
+PRICE_RISK_SHIELD    = _price(45_000)
+PRICE_ANALYTICS_PRO  = _price(25_000)
 
 
 CATALOG: dict[str, dict] = {

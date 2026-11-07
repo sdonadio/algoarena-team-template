@@ -54,6 +54,11 @@ STP_SCOPE = os.environ.get("STP_SCOPE", "team").lower()
 INITIAL_CASH = 100_000.0          # starting cash for every team
 SNAPSHOT_INTERVAL_SEC = 0.5       # book-snapshot broadcast cadence
 LEADERBOARD_INTERVAL_SEC = 2.0    # leaderboard broadcast cadence
+# Open play (week 0) only: slower periodic book snapshots / leaderboard for
+# student bots, to cut the hosted venue's egress. Observers, the teacher and house bots keep
+# the normal cadence; graded weeks are untouched. 0 = off (default).
+OPEN_PLAY_SNAPSHOT_INTERVAL_SEC = float(os.getenv("OPEN_PLAY_SNAPSHOT_INTERVAL_SEC", "0"))
+OPEN_PLAY_LEADERBOARD_INTERVAL_SEC = float(os.getenv("OPEN_PLAY_LEADERBOARD_INTERVAL_SEC", "0"))
 MAX_ORDER_SIZE = 500               # max shares / units per single order
 SESSION_DURATION_SEC = 3600        # nominal session length (teacher may close early)
 
@@ -155,6 +160,51 @@ LIQUIDATION_PENALTY  = float(os.environ.get("LIQUIDATION_PENALTY", "0.01"))   # 
 # the same book, and the policy is already spent.
 RISK_SHIELD_GRACE_TICKS = int(os.environ.get("RISK_SHIELD_GRACE_TICKS", "120"))
 
+# ── House bots (the venue's own liquidity and flow) ───────────────────────────
+# The house market maker and the background flow bots are FURNITURE, not
+# competitors: their P&L is play money and the class depends on them being
+# able to quote two-sided all week. A multi-day "open play" session charges
+# them BORROW_FEE_PER_TICK on a short book every tick, so the reference MM
+# eventually trips the maintenance check, gets liquidated, and the book goes
+# one-sided for everyone (observed twice on the hosted arena, ~30 h after
+# each start). House ids are therefore exempt from:
+#   * the maintenance/margin liquidation check (a warning is logged instead)
+#   * the per-tick order/cancel message quota, which a 10-symbol two-sided
+#     ladder blows through on every requote (HOUSE_ORDER_QUOTA_PER_TICK)
+#
+# SECURITY: this list comes from the ENVIRONMENT ONLY — never from the roster,
+# never from registration, never from anything a student can write. A student
+# cannot become a house bot by naming their team, because with
+# AUTH_REQUIRED=true the team id they may claim is bound to their token.
+def house_team_ids_from_env(env: "os._Environ | dict[str, str] | None" = None
+                            ) -> tuple[str, ...]:
+    """Parse HOUSE_TEAM_IDS (+ the LIQUIDATION_EXEMPT alias) into ids.
+
+    Comma-separated, whitespace-tolerant, duplicate- and blank-free, order
+    preserved. `LIQUIDATION_EXEMPT` is accepted as an additive alias so a
+    deployment that only wants the liquidation exemption can say so.
+    """
+    src = os.environ if env is None else env
+    raw = ",".join(filter(None, (
+        src.get("HOUSE_TEAM_IDS", "house_bots_broker"),
+        src.get("LIQUIDATION_EXEMPT", ""),
+    )))
+    return tuple(dict.fromkeys(
+        part.strip() for part in raw.split(",") if part.strip()))
+
+
+HOUSE_TEAM_IDS: tuple[str, ...] = house_team_ids_from_env()
+# Order/cancel messages per tick for a house bot (0 = unmetered). A two-sided
+# QUOTE_LEVELS=3 ladder is 12 messages per symbol per requote, so ten symbols
+# need far more than the ORDER_QUOTA_PER_TICK=20 a student team gets.
+HOUSE_ORDER_QUOTA_PER_TICK = float(
+    os.environ.get("HOUSE_ORDER_QUOTA_PER_TICK", "200"))
+
+
+def is_house_bot(team_id: str | None) -> bool:
+    """True when `team_id` is one of the venue-operated bots (env list only)."""
+    return bool(team_id) and team_id in HOUSE_TEAM_IDS
+
 # ── Earned leverage & margin tiers (opt-in) ──────────────────────────────────
 # When LEVERAGE_ENABLED, a team's buying power is governed by its EQUITY and a
 # per-level leverage multiple, instead of the flat share cap + cash-only
@@ -225,6 +275,15 @@ TRADE_LOG_MAXLEN = int(os.environ.get("TRADE_LOG_MAXLEN", "20000"))
 # exchange stops writing, logs once at WARNING, and keeps trading. The file
 # already written stays on disk and replays fine.
 RECORD_MAX_MB = float(os.environ.get("RECORD_MAX_MB", "512"))
+# Record every GRADED LIVE BLOCK to its own file, independently of
+# RECORD_SESSIONS. The hosted venue runs one always-open week-0 session for
+# days at a time (SESSION_AUTOOPEN), so the open/close-tied recording above is
+# either off or one enormous file. The teacher's `set_week` to a week > 0 is
+# the real start of Friday's graded block: it rolls a fresh
+# sessions/session_weekNN_<ts>.jsonl, and `set_week 0` closes it. That tape is
+# what scripts/live_readiness.py grades, so it stays on even when open play is
+# not being recorded.
+RECORD_WEEKS = os.environ.get("RECORD_WEEKS", "true").lower() in ("true", "1", "yes")
 
 # ── Per-team capital allocation ───────────────────────────────────────────────
 # Teams created with scripts/create_team.py choose how to invest their budget
@@ -303,6 +362,33 @@ def is_primary_venue() -> bool:
     same week scenario must not mint the same deal a second time.
     """
     return venue_cash_fraction() >= 1.0
+
+
+# Credit a STUDENT venue's net fee income (taker fee minus maker rebate, per
+# trade) to the owning team's `exchange` node, so a licensed venue's revenue
+# counts in that team's net worth and season score. Default OFF: with the
+# flag off the venue's revenue stays display-only, exactly as before. Has no
+# effect on the primary (house) venue, which has no owner.
+VENUE_REVENUE_TO_OWNER = os.environ.get(
+    "VENUE_REVENUE_TO_OWNER", "false").lower() in ("true", "1", "yes")
+
+
+def venue_owner_node(port: int | None = None) -> str | None:
+    """The roster `exchange` node id of the team that owns the venue on
+    `port` (default: this process's PORT), or None on the primary venue /
+    a port no roster team owns / an owner entry with no exchange node."""
+    target = PORT if port is None else int(port)
+    for team_cfg in _read_roster().values():
+        if not isinstance(team_cfg, dict):
+            continue
+        try:
+            if int(team_cfg.get("exchange_port") or 0) != target:
+                continue
+        except (TypeError, ValueError):
+            continue
+        node = team_cfg.get("exchange")
+        return str(node) if node else None
+    return None
 
 
 def starting_cash_for(team_id: str) -> float:
@@ -428,6 +514,25 @@ UPGRADE_EFFECTS: dict[str, dict] = {
 }
 
 
+# Optional: make fee_tier a RELATIVE discount on this venue's own schedule
+# instead of the fixed 12 bp above. Unset (the default) keeps the fixed rate.
+# A venue with punitive fees sets it so that the upgrade cannot buy its way
+# out of them: FEE_TIER_DISCOUNT=0.25 → taker fee x0.75, and a maker fee
+# (negative rebate) is cut by 25% too, a positive rebate raised by 25%.
+def _fee_tier_discount() -> float | None:
+    raw = os.environ.get("FEE_TIER_DISCOUNT", "").strip()
+    if not raw:
+        return None
+    try:
+        d = float(raw)
+    except ValueError:
+        return None
+    return d if 0.0 < d < 1.0 else None
+
+
+FEE_TIER_DISCOUNT = _fee_tier_discount()
+
+
 def config_for_team(bot_id: str, key: str):
     """Resolve a tunable for one bot: base config value, then upgrades.
 
@@ -452,7 +557,11 @@ def config_for_team(bot_id: str, key: str):
     for upgrade_key, fixed in spec["by_upgrade"].items():
         if not owned.get(upgrade_key):
             continue
-        if fixed is not None:
+        if (upgrade_key == "fee_tier" and FEE_TIER_DISCOUNT is not None
+                and key in ("taker_fee", "maker_rebate")):
+            d = FEE_TIER_DISCOUNT
+            candidate = base * (1 - d) if key == "taker_fee" else base + abs(base) * d
+        elif fixed is not None:
             candidate = fixed
         elif upgrade_key in (spec.get("multiplier") or {}):
             # Relative effect (e.g. "double the quota"), so a week that
@@ -477,13 +586,22 @@ def config_for_team(bot_id: str, key: str):
 # resolution of the vol and drawdown numbers.
 SEASON_SNAPSHOT_TICKS = int(os.environ.get("SEASON_SNAPSHOT_TICKS", "60"))
 
-# Whether the exchange reads and writes the season file at all.
-#   "auto"  (default) — only when a week is configured (GAME_WEEK /
-#           SCENARIO_PATH / set_week). Plain local play therefore stays
-#           ephemeral, exactly as it was before the season system: restarting
-#           the exchange resets portfolios.
-#   "true"  — always persist, even in open play.
-#   "false" — never persist.
+# Whether the exchange reads and writes the season file (data/season.json).
+# Read and write are deliberately asymmetric — see ExchangeServer.season_loads
+# and .season_persists:
+#   "auto"  (default) — WRITE only when a week is configured (GAME_WEEK /
+#           SCENARIO_PATH / set_week), but always READ an existing season file
+#           at startup, whatever the week. The hosted venue boots parked in
+#           open play (week 0) and only switches into the graded week on
+#           Friday; a boot that skipped the read would overwrite every earlier
+#           week at the block's first checkpoint. Plain local play is still
+#           ephemeral: with no season file there is nothing to read, and open
+#           play writes nothing.
+#   "true"  — always persist, even in open play (read and write).
+#   "false" — never persist: neither read nor written (the simulator sets
+#           this, see sim/arena.py).
+# Independently of this switch, open play (week 0) NEVER contributes equity
+# snapshots to the season score — see ExchangeServer.snapshot_equity().
 SEASON_PERSIST = os.environ.get("SEASON_PERSIST", "auto").lower()
 
 # ── Market calendar & shock ramps ─────────────────────────────────────────────
@@ -496,6 +614,15 @@ CALENDAR_ANNOUNCE_LEAD = int(os.environ.get("CALENDAR_ANNOUNCE_LEAD", "120"))
 # half as many ticks again. Set SHOCK_RAMP_TICKS=1 for the old instant step.
 SHOCK_RAMP_TICKS = int(os.environ.get("SHOCK_RAMP_TICKS", "15"))
 SHOCK_OVERSHOOT  = float(os.environ.get("SHOCK_OVERSHOOT", "1.3"))
+# Seed for a week file's flash series (the {"kind": "flash", "every": N}
+# form — exchange/calendar.py). Empty (default) = drawn from the global RNG
+# when the week loads: reproducible in the seeded simulator, unknowable live.
+# Only consulted when a week actually schedules flashes.
+FLASH_SEED = os.environ.get("FLASH_SEED", "")
+# A flash is skipped on a symbol whose move over the velocity window plus the
+# flash itself would reach this fraction of VELOCITY_HALT_PCT (circuit
+# breakers on), so a flash can never be the thing that halts a name.
+FLASH_VELOCITY_HEADROOM = float(os.environ.get("FLASH_VELOCITY_HEADROOM", "0.6"))
 
 # ── Interest on idle cash ─────────────────────────────────────────────────────
 # Positive balances earn this per tick in the carry pass — the hurdle rate a

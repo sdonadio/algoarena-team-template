@@ -29,9 +29,10 @@ Schema (see docs/SEASON_GUIDE.md for the authoritative reference):
     }
 
 Backward compatibility: with no scenario file the exchange runs
-`OPEN_PLAY` — every flag permissive and no config override — so local play
-(`make exchange` + `make bots`) behaves exactly as it did before the season
-system existed.
+`OPEN_PLAY` — every flag permissive, no config override, and `scoring_counts`
+off — so local play (`make exchange` + `make bots`) behaves exactly as it did
+before the season system existed, and the always-open hosted venue collects
+no season snapshots between graded blocks.
 """
 
 from __future__ import annotations
@@ -78,7 +79,30 @@ ALLOWED_CONFIG_OVERRIDES: dict[str, type] = {
     "SSR_TRIGGER_PCT": float,         # short-sale rule trip point; 0 = off
     "SHORT_LOCATE_CAP": int,          # market-wide borrow pool; 0 = unlimited
     "LULD_BAND_PCT": float,           # erroneous-order collar; 0 = off
+    # Market-data cadence (week 7 "fast market"). Applied with the week and
+    # restored when it ends, so open play (week 0) always runs the config
+    # default — and the OPEN_PLAY_* student throttle, which is env-only and
+    # keyed on week 0, is never affected by a week file.
+    "SNAPSHOT_INTERVAL_SEC": float,   # book-snapshot broadcast cadence
+    "LADDER_DEPTH": int,              # observer/teacher queue-ladder levels
 }
+
+# Clamp for overrides where a typo in a week file could hurt the venue
+# (a 0.001 s snapshot cadence would saturate the hosted box).
+OVERRIDE_BOUNDS: dict[str, tuple[float, float]] = {
+    "SNAPSHOT_INTERVAL_SEC": (0.1, 2.0),
+    "LADDER_DEPTH": (1, 20),
+}
+
+
+def _cast_override(attr: str, value: Any) -> Any:
+    """Cast one whitelisted override and clamp it to OVERRIDE_BOUNDS."""
+    out = ALLOWED_CONFIG_OVERRIDES[attr](value)
+    bounds = OVERRIDE_BOUNDS.get(attr)
+    if bounds is not None:
+        lo, hi = bounds
+        out = type(out)(min(hi, max(lo, out)))
+    return out
 
 
 @dataclass
@@ -96,6 +120,9 @@ class Scenario:
     # config default (0.10). Week 5 raises it so the liquidation lesson has
     # teeth: at 0.10, 30 simulated seasons produced zero liquidations.
     maintenance_fraction: float | None = None
+    # Whether this week's equity snapshots feed the season score. True by
+    # default (an ordinary week file that omits the key counts); week 0 /
+    # open play overrides it to False — see open_play().
     scoring_counts: bool = True
     events: list[dict[str, Any]] = field(default_factory=list)
     # Whitelisted exchange.config overrides (see ALLOWED_CONFIG_OVERRIDES).
@@ -138,9 +165,12 @@ class Scenario:
             "maintenance_fraction": self.maintenance_fraction,
             "scoring_counts": self.scoring_counts,
             "config": dict(self.config_overrides),
+            # Flashes are unannounced: visible only as they fire (FLASH
+            # session event), never in the published week.
             "events": [
                 {k: v for k, v in ev.items() if k != "direction"}
                 for ev in self.events
+                if str(ev.get("kind", "")) != "flash"
             ],
         }
 
@@ -169,11 +199,10 @@ class Scenario:
                 self._saved[attr] = getattr(config, attr)
                 setattr(config, attr, bool(self.flags[flag]))
         for attr, value in self.config_overrides.items():
-            caster = ALLOWED_CONFIG_OVERRIDES.get(attr)
-            if caster is None:
+            if attr not in ALLOWED_CONFIG_OVERRIDES:
                 continue
             self._saved[attr] = getattr(config, attr)
-            setattr(config, attr, caster(value))
+            setattr(config, attr, _cast_override(attr, value))
 
     def restore(self) -> None:
         """Undo apply()."""
@@ -184,8 +213,19 @@ class Scenario:
 
 # The permissive scenario used whenever no week is configured.
 def open_play() -> Scenario:
-    """The default rule set: everything allowed, nothing overridden."""
-    return Scenario()
+    """The default rule set: everything allowed, nothing overridden.
+
+    Open play NEVER scores. The hosted venue is always up: the teacher
+    switches to week N for the graded Friday block and back to week 0
+    afterwards, so the venue spends most of the season here. Those
+    free-play returns must not land in anybody's season mean, vol or
+    drawdown, hence scoring_counts=False (the exchange also refuses to
+    snapshot at week 0 — see ExchangeServer.snapshot_equity).
+
+    Scenario's own default stays True because a week FILE that omits
+    `scoring_counts` means "this week counts"; only week 0 is free play.
+    """
+    return Scenario(scoring_counts=False)
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +335,10 @@ def scenario_shocks(scenario: Scenario, max_tick: int) -> list:
         kind = str(ev.get("kind", ""))
         if kind in ("dividend", "ipo"):
             continue      # cash / listing events, not price shocks
+        if kind == "flash":
+            # Unannounced and self-reverting: nobody, not even the insider
+            # predictor, is told about one. The exchange calendar fires it.
+            continue
         tick = int(ev.get("tick", 0))
         if tick <= 0:
             continue

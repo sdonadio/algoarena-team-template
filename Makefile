@@ -7,8 +7,7 @@ export
 ARENA_URL ?= https://arena.example.edu
 # The engine lives under engine/ — every target needs it importable.
 export PYTHONPATH := engine:.
-# The season's week scenarios (the rules and event calendar of each Friday
-# block) ship under season/ so the season simulator runs offline.
+# The season's week scenarios ship under season/ so the simulator runs offline.
 export SEASON_DIR := season
 export SEASON_PERSIST := false
 
@@ -42,7 +41,7 @@ WEEK ?= 1
 season:
 	python scripts/season_sim.py --weeks $(WEEK)
 
-# Replay a recorded block into a local dashboard: make replay FILE=sessions/<file>
+# Replay a recorded block as a local exchange: make replay FILE=sessions/<file>
 replay:
 	python scripts/replay_session.py $(FILE) --speed 5
 

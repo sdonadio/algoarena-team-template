@@ -198,6 +198,11 @@ class BrokerBot:
         self._loop: asyncio.AbstractEventLoop | None = None
         # Multi-venue: only one instance polls Yahoo; the rest read its dict.
         self._own_yahoo_feed = True
+        # Message budget (see requote_loop): a rolling one-second window, and
+        # the rotation offset that stops the same symbols always going first.
+        self._msg_window_start = 0.0
+        self._msgs_this_second = 0.0
+        self._rotate = 0
 
     # ------------------------------------------------------------------
     # Exchange connection
@@ -441,6 +446,39 @@ class BrokerBot:
         age = time.time() - self.state.last_quote_time.get(symbol, 0.0)
         return age >= config.QUOTE_MAX_AGE_SEC  # backstop: never rest forever
 
+    @staticmethod
+    def quote_cost() -> float:
+        """Messages one full requote of one symbol costs the venue quota.
+
+        Cancel both sides of a QUOTE_LEVELS ladder, then repost both sides.
+        """
+        return 4.0 * config.QUOTE_LEVELS
+
+    def spend_msg_budget(self, cost: float, now: float) -> bool:
+        """Consume `cost` messages from this second's budget. False if short.
+
+        A plain rolling one-second window rather than a token bucket: the
+        venue meters per tick, so the desk's own limit is per second too.
+        REQUOTE_MSG_BUDGET_PER_SEC = 0 disables it.
+        """
+        budget = config.REQUOTE_MSG_BUDGET_PER_SEC
+        if budget <= 0:
+            return True
+        if now - self._msg_window_start >= 1.0:
+            self._msg_window_start = now
+            self._msgs_this_second = 0.0
+        if self._msgs_this_second + cost > budget:
+            return False
+        self._msgs_this_second += cost
+        return True
+
+    def rotated_symbols(self) -> list[str]:
+        """The quoting universe, starting where the last pass left off."""
+        syms = list(self._quote_symbols)
+        if not syms:
+            return []
+        return syms[self._rotate % len(syms):] + syms[:self._rotate % len(syms)]
+
     async def quote_symbol(self, symbol: str) -> None:
         """Post a fresh bid + ask around the centre, if the market moved.
 
@@ -564,16 +602,33 @@ class BrokerBot:
             # full ladder for every symbol in one tick and eats the venue's
             # message quota (RATE_LIMITED on the very first look).
             fresh_budget = config.QUOTE_BURST_SYMBOLS
-            for sym in list(self._quote_symbols):
+            # Rotate the order every pass: with a message budget, a fixed
+            # order would refresh AAPL forever and leave INTC unquoted.
+            order = self.rotated_symbols()
+            served = 0
+            for sym in order:
                 fresh = sym not in self.state.last_quote_prices
                 if fresh:
                     if fresh_budget <= 0:
+                        served += 1
                         continue            # next pass, 0.5s away
                     fresh_budget -= 1
+                # Decide BEFORE spending budget whether this symbol would
+                # send anything at all — an unchanged quote is free, and
+                # must not consume the allowance a moved symbol needs.
+                centre = self.quote_centre(sym)
+                if not centre or not self.needs_requote(sym, centre):
+                    served += 1
+                    continue
+                if not self.spend_msg_budget(self.quote_cost(), time.time()):
+                    break        # out of messages this second — resume here
+                served += 1
                 try:
                     await self.quote_symbol(sym)
                 except Exception:
                     logger.exception("requote_loop error for %s", sym)
+            if order:
+                self._rotate = (self._rotate + served) % len(order)
 
     # ------------------------------------------------------------------
     # Yahoo Finance price feed

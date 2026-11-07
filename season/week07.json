@@ -1,6 +1,6 @@
 {
   "week": 7,
-  "label": "Execution \u2014 quotas, latency, cancel fees; borrow tightens; window 2",
+  "label": "Execution in a fast market \u2014 quotas, latency, cancel fees, flashes; borrow tightens; window 2",
   "flags": {
     "shorts_allowed": true,
     "post_only_allowed": true,
@@ -20,7 +20,8 @@
     "CLOSING_AUCTION_TICKS": 10,
     "SSR_TRIGGER_PCT": 0.08,
     "SHORT_LOCATE_CAP": 1200,
-    "LULD_BAND_PCT": 0.08
+    "LULD_BAND_PCT": 0.08,
+    "SNAPSHOT_INTERVAL_SEC": 0.2
   },
   "events": [
     {
@@ -55,6 +56,19 @@
       "tick": 1200,
       "symbol": "META",
       "amount_per_share": 0.5
+    },
+    {
+      "kind": "flash",
+      "every": 150,
+      "start": 90,
+      "end": 2850,
+      "jitter": 40,
+      "avoid": 40,
+      "magnitude_range": [
+        0.015,
+        0.025
+      ],
+      "revert_ticks": 2
     }
   ]
 }
